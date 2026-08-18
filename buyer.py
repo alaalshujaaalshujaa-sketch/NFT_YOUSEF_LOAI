@@ -1,11 +1,10 @@
 """
 محرك الشراء التلقائي المتعدد المحافظ عبر عقد SeaDrop.
-النسخة المحسنة مع:
+دمج الكود الأصلي مع التحسينات:
 - حد أقصى للغاز 5 سنتات
-- مراقبة المينتات المدفوعة
+- حد السعر المجاني 0.01 دولار
 - إعادة المحاولة التلقائية
 - تخزين الحالة في قاعدة بيانات
-- حد السعر المجاني 0.01 دولار
 """
 
 import asyncio
@@ -17,7 +16,7 @@ from web3.exceptions import ContractLogicError
 
 log = logging.getLogger("buyer")
 
-# ======================== الثوابت ========================
+# ======================== الثوابت (من الكود الأصلي) ========================
 
 SEADROP_ADDRESS = Web3.to_checksum_address("0x00005EA00Ac477B1030CE78506496e8C2dE24bf5")
 ZERO_ADDRESS = Web3.to_checksum_address("0x0000000000000000000000000000000000000000")
@@ -25,18 +24,18 @@ ZERO_ADDRESS = Web3.to_checksum_address("0x0000000000000000000000000000000000000
 # الحد الأقصى لرسوم الغاز (5 سنتات)
 MAX_GAS_FEE_USD = 0.05
 
-# حد السعر المجاني (0.01 دولار = 1 سنت)
+# حد السعر المجاني (0.01 دولار - كما في الكود الأصلي)
 FREE_PRICE_THRESHOLD_USD = 0.01
 
-# إعدادات الشراء
+# إعدادات الشراء (من الكود الأصلي)
 MIN_BALANCE_RESERVE_USD = 0.10
 FEW_THRESHOLD = 20
-LIMITED_BUY_QTY = 3
+LIMITED_BUY_QTY = 3  # تم تخفيضها من 15 إلى 3
 GAS_LIMIT_SAFETY_MARGIN = 1.2
 MAX_RETRY_ATTEMPTS = 3
 RETRY_DELAY_SECONDS = 2
 
-# ======================== ABI ========================
+# ======================== ABI (من الكود الأصلي) ========================
 
 SEADROP_ABI = [
     {
@@ -76,9 +75,16 @@ SEADROP_ABI = [
         "stateMutability": "view",
         "type": "function",
     },
+    {
+        "inputs": [{"name": "nftContract", "type": "address"}],
+        "name": "totalSupply",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
 ]
 
-# ======================== الأقفال ========================
+# ======================== الأقفال (من الكود الأصلي) ========================
 
 wallet_locks = {}
 
@@ -91,7 +97,7 @@ def get_wallet_lock(wallet_address: str) -> asyncio.Lock:
     return wallet_locks[addr]
 
 
-# ======================== دوال Web3 ========================
+# ======================== دوال Web3 (من الكود الأصلي مع تحسينات) ========================
 
 def get_web3(rpc_url: str) -> Web3:
     """إنشاء اتصال Web3"""
@@ -203,7 +209,7 @@ def calculate_max_gas_units(eth_price_usd: float) -> int:
     try:
         max_gas_in_eth = MAX_GAS_FEE_USD / eth_price_usd
         max_gas_units = int((max_gas_in_eth * 1e18) / 1)
-        return int(max_gas_units * 0.8)  # 80% كحد أمان
+        return int(max_gas_units * 0.8)
     except Exception as e:
         log.warning(f"[حساب الغاز] خطأ: {e}")
         return 150_000
@@ -226,13 +232,13 @@ def decide_quantity(max_per_wallet: Optional[int], remaining_supply: int) -> int
 def is_free_or_negligible(price_wei: int, eth_price_usd: float) -> bool:
     """
     التحقق من أن السعر مجاني أو لا يُذكر
-    الحد الأدنى: 0.01 دولار (1 سنت)
+    الحد الأدنى: 0.01 دولار (كما في الكود الأصلي)
     """
     price_usd = (price_wei / 1e18) * eth_price_usd
     return price_usd < FREE_PRICE_THRESHOLD_USD
 
 
-# ======================== دالة الشراء الرئيسية ========================
+# ======================== دالة الشراء الرئيسية (من الكود الأصلي مع تحسينات) ========================
 
 def attempt_purchase_single_wallet(
     w3: Web3,
@@ -246,10 +252,7 @@ def attempt_purchase_single_wallet(
     retry_count: int = 0,
 ) -> Dict[str, Any]:
     """
-    محاولة الشراء بمحفظة واحدة مع:
-    - حد أقصى للغاز 5 سنتات
-    - إعادة محاولة تلقائية
-    - تحقق من نشاط المينت
+    محاولة الشراء بمحفظة واحدة - مأخوذة من الكود الأصلي مع تحسينات الغاز
     """
     try:
         checksum_wallet = Web3.to_checksum_address(wallet_address)
@@ -296,7 +299,7 @@ def attempt_purchase_single_wallet(
         contract = w3.eth.contract(address=SEADROP_ADDRESS, abi=SEADROP_ABI)
         nonce = w3.eth.get_transaction_count(checksum_wallet, "pending")
 
-        # بناء المعاملة
+        # بناء المعاملة (من الكود الأصلي)
         tx = contract.functions.mintPublic(
             checksum_contract,
             Web3.to_checksum_address(fee_recipient),
@@ -334,7 +337,7 @@ def attempt_purchase_single_wallet(
         if wallet_balance_wei < total_cost_wei:
             return {"success": False, "wallet": checksum_wallet, "reason": "insufficient_funds"}
 
-        # 9. توقيع وإرسال المعاملة
+        # 9. توقيع وإرسال المعاملة (من الكود الأصلي)
         signed = w3.eth.account.sign_transaction(tx, private_key=private_key)
         tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
 
