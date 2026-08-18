@@ -5,9 +5,9 @@
 - شراء تلقائي عند تحول المدفوع إلى مجاني
 - حد أقصى للغاز 5 سنتات
 - تخزين الحالة في SQLite
-- التحقق من حساب X والموقع الإلكتروني
+- التحقق من حساب X أو الموقع الإلكتروني (أحدهما كافٍ)
 - إشعارات محسنة مع تفاصيل كاملة
-- حد السعر المجاني 0.0001 دولار
+- حد السعر المجاني 0.01 دولار (كما في الكود الأصلي)
 """
 
 import asyncio
@@ -42,7 +42,7 @@ load_dotenv()
 
 OPENSEA_API_KEY = os.environ["OPENSEA_API_KEY"]
 BOT_ENABLED = os.environ.get("BOT_ENABLED", "false").lower() == "true"
-CHECK_WEBSITE = os.environ.get("CHECK_WEBSITE", "false").lower() == "true"  # تفعيل التحقق من الموقع
+CHECK_WEBSITE = os.environ.get("CHECK_WEBSITE", "true").lower() == "true"  # تفعيل التحقق من الموقع
 
 # المحافظ والمفاتيح
 PRIVATE_KEYS = [k.strip() for k in os.environ.get("PRIVATE_KEYS", "").split(",") if k.strip()]
@@ -399,7 +399,7 @@ def build_success_msg(detail: Dict[str, Any], result: Dict[str, Any], chain_key:
         f"🆔 <b>المجموعة:</b> <a href='{url}'>{name}</a>\n"
         f"👛 <b>المحفظة:</b> <code>{w_short}</code>\n"
         f"📦 <b>الكمية:</b> {result['quantity']}\n"
-        f"💰 <b>سعر التوكن:</b> ${price_usd:.6f}\n"
+        f"💰 <b>سعر التوكن:</b> ${price_usd:.4f}\n"
         f"⛽ <b>رسوم الغاز:</b> ${result['gas_fee_usd']:.4f} (حد: ${MAX_GAS_FEE_USD})\n"
         f"📊 <b>وحدات الغاز:</b> {result.get('gas_units', 'N/A')}\n"
     )
@@ -430,7 +430,7 @@ def build_watching_msg(detail: Dict[str, Any], reason: str, price_usd: float = N
     )
     
     if price_usd is not None:
-        msg += f"💰 <b>السعر الحالي:</b> ${price_usd:.6f}\n"
+        msg += f"💰 <b>السعر الحالي:</b> ${price_usd:.4f}\n"
     
     msg += f"📝 <b>السبب:</b> {reason}\n"
     
@@ -441,10 +441,10 @@ def build_watching_msg(detail: Dict[str, Any], reason: str, price_usd: float = N
         msg += f"🌐 <b>الموقع:</b> <a href='{website}'>{website}</a>\n"
     
     msg += (
-        f"📊 <b>حد السعر المجاني:</b> ${FREE_PRICE_THRESHOLD_USD:.6f}\n"
+        f"📊 <b>حد السعر المجاني:</b> ${FREE_PRICE_THRESHOLD_USD:.4f}\n"
         f"⏳ <b>الحالة:</b> في انتظار تحول السعر إلى مجاني\n"
         f"{'═' * 30}\n"
-        f"💡 سيتم الشراء تلقائياً فور وصول السعر إلى ${FREE_PRICE_THRESHOLD_USD:.6f} أو أقل"
+        f"💡 سيتم الشراء تلقائياً فور وصول السعر إلى ${FREE_PRICE_THRESHOLD_USD:.4f} أو أقل"
     )
     
     return msg
@@ -506,11 +506,12 @@ def build_startup_msg() -> str:
         f"{'═' * 30}\n"
         f"👛 <b>عدد المحافظ:</b> {wallet_count}\n"
         f"⛽ <b>حد الغاز الأقصى:</b> ${MAX_GAS_FEE_USD}\n"
-        f"💰 <b>حد السعر المجاني:</b> ${FREE_PRICE_THRESHOLD_USD:.6f}\n"
+        f"💰 <b>حد السعر المجاني:</b> ${FREE_PRICE_THRESHOLD_USD:.4f}\n"
         f"🔍 <b>التحقق من X:</b> ✅ مفعل\n"
         f"🌐 <b>التحقق من الموقع:</b> {'✅ مفعل' if CHECK_WEBSITE else '❌ معطل'}\n"
+        f"📌 <b>سياسة الشراء:</b> يتطلب X أو موقع (أحدهما كافٍ)\n"
         f"{'═' * 30}\n"
-        f"👀 جارٍ مراقبة المينتات التي يقل سعرها عن ${FREE_PRICE_THRESHOLD_USD:.6f}..."
+        f"👀 جارٍ مراقبة المينتات التي يقل سعرها عن ${FREE_PRICE_THRESHOLD_USD:.4f}..."
     )
 
 
@@ -624,7 +625,7 @@ async def try_buy_now_multi_wallet(
     onchain_price = await asyncio.to_thread(get_onchain_public_price_wei, w3, contract_address)
     price_wei = onchain_price if onchain_price is not None else int(stage.get("price", "0"))
 
-    # التحقق من السعر المجاني باستخدام الحد الجديد 0.0001
+    # التحقق من السعر المجاني باستخدام الحد 0.01 دولار
     if not is_free_or_negligible(price_wei, eth_price_usd):
         return None  # مدفوع → مراقبة
 
@@ -654,7 +655,7 @@ async def try_buy_now_multi_wallet(
 # ======================== تقييم المينتات ========================
 
 async def evaluate_new_mint(slug: str, chain_key: str):
-    """تقييم مينت جديد مع التحقق من X والموقع"""
+    """تقييم مينت جديد - يتطلب X أو موقع (أحدهما كافٍ)"""
     if (
         len(successful_mints.get(slug, set())) >= len(WALLETS_DATA)
         or slug in watchlist
@@ -673,25 +674,34 @@ async def evaluate_new_mint(slug: str, chain_key: str):
         if not stage or not started_today_local(stage):
             return
 
-        # 1. التحقق من وجود حساب X (تويتر) أولاً
+        # ======================== التحقق من X والموقع (أحدهما كافٍ) ========================
+        
+        # 1. التحقق من وجود حساب X (تويتر)
         twitter_username = await asyncio.to_thread(get_twitter_username_from_opensea, slug, OPENSEA_API_KEY)
-        if not twitter_username:
-            log.info(f"⏭️ تجاهل '{slug}': لا يوجد حساب X")
-            mark_rejected(slug)
-            return
-
+        
         # 2. التحقق من وجود موقع إلكتروني (إذا كان مفعلاً)
         website = None
         if CHECK_WEBSITE:
             website = await asyncio.to_thread(get_website_from_opensea, slug, OPENSEA_API_KEY)
-            if not website:
-                log.info(f"⏭️ تجاهل '{slug}': لا يوجد موقع إلكتروني")
-                mark_rejected(slug)
-                msg = build_watching_msg(detail, "لا يوجد موقع إلكتروني", twitter=twitter_username)
-                broadcast_message(msg)
-                return
 
-        log.info(f"✅ '{slug}': X موجود (@{twitter_username})" + (f", الموقع: {website}" if website else ""))
+        # التحقق: يجب أن يكون لدينا X أو موقع
+        has_twitter = bool(twitter_username)
+        has_website = bool(website) if CHECK_WEBSITE else True  # إذا كان CHECK_WEBSITE=false، نعتبر الموقع موجوداً
+        
+        if not (has_twitter or has_website):
+            log.info(f"⏭️ تجاهل '{slug}': لا يوجد X ولا موقع")
+            mark_rejected(slug)
+            msg = build_watching_msg(detail, "لا يوجد حساب X ولا موقع إلكتروني")
+            broadcast_message(msg)
+            return
+        
+        # سجل ما تم العثور عليه
+        found_parts = []
+        if has_twitter:
+            found_parts.append(f"X: @{twitter_username}")
+        if has_website:
+            found_parts.append(f"موقع: {website}")
+        log.info(f"✅ '{slug}': تم العثور على {', '.join(found_parts)}")
 
         w3 = W3_INSTANCES[chain_key]
         eth_price_usd = get_eth_price_usd()
@@ -707,23 +717,27 @@ async def evaluate_new_mint(slug: str, chain_key: str):
             
             price_usd = (price_wei / 1e18) * eth_price_usd
             
-            # إذا كان المينت مدفوعاً (أعلى من 0.0001 دولار)، ضعه في قائمة المراقبة
+            # إذا كان المينت مدفوعاً، ضعه في قائمة المراقبة
             if not is_free_or_negligible(price_wei, eth_price_usd):
                 if slug not in watchlist:
                     watchlist[slug] = {"chain_key": chain_key, "detail": detail}
                     save_watchlist(slug, chain_key, detail)
                     msg = build_watching_msg(
                         detail,
-                        f"السعر الحالي ${price_usd:.6f} - في انتظار الوصول إلى ${FREE_PRICE_THRESHOLD_USD:.6f} أو أقل",
+                        f"السعر الحالي ${price_usd:.4f} - في انتظار الوصول إلى ${FREE_PRICE_THRESHOLD_USD:.4f} أو أقل",
                         price_usd,
-                        twitter_username,
-                        website
+                        twitter_username if has_twitter else None,
+                        website if has_website else None
                     )
                     broadcast_message(msg)
                 return
 
         # محاولة الشراء
-        results = await try_buy_now_multi_wallet(slug, chain_key, detail, twitter_username, website)
+        results = await try_buy_now_multi_wallet(
+            slug, chain_key, detail,
+            twitter_username if has_twitter else None,
+            website if has_website else None
+        )
 
         if results is None:
             # مدفوع → مراقبة
@@ -732,9 +746,9 @@ async def evaluate_new_mint(slug: str, chain_key: str):
                 save_watchlist(slug, chain_key, detail)
                 msg = build_watching_msg(
                     detail,
-                    f"في انتظار وصول السعر إلى ${FREE_PRICE_THRESHOLD_USD:.6f} أو أقل",
-                    twitter=twitter_username,
-                    website=website
+                    f"في انتظار وصول السعر إلى ${FREE_PRICE_THRESHOLD_USD:.4f} أو أقل",
+                    twitter=twitter_username if has_twitter else None,
+                    website=website if has_website else None
                 )
                 broadcast_message(msg)
             return
@@ -905,8 +919,9 @@ async def run():
     
     log.info(f"✅ تم التحميل: {len(successful_mints)} مينت, {len(watchlist)} مراقبة")
     log.info(f"💰 حد الغاز: ${MAX_GAS_FEE_USD}")
-    log.info(f"💰 حد السعر المجاني: ${FREE_PRICE_THRESHOLD_USD:.6f}")
+    log.info(f"💰 حد السعر المجاني: ${FREE_PRICE_THRESHOLD_USD:.4f}")
     log.info(f"🌐 التحقق من الموقع: {'مفعل' if CHECK_WEBSITE else 'معطل'}")
+    log.info(f"📌 سياسة الشراء: يتطلب X أو موقع (أحدهما كافٍ)")
     
     broadcast_message(build_startup_msg())
     
