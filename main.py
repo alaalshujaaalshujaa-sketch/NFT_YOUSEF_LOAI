@@ -1,13 +1,13 @@
 """
-النظام الكامل - بوت شراء تلقائي متعدد المحافظ مع:
+النظام الكامل - بوت شراء تلقائي متعدد المحافظ.
+دمج الكود الأصلي مع التحسينات:
 - 10 محافظ، لكل محفظة بوت تيليجرام خاص
 - مراقبة المينتات المجانية والمدفوعة
 - شراء تلقائي عند تحول المدفوع إلى مجاني
 - حد أقصى للغاز 5 سنتات
-- تخزين الحالة في SQLite
-- التحقق من حساب X أو الموقع الإلكتروني (أحدهما كافٍ)
-- إشعارات محسنة مع تفاصيل كاملة
 - حد السعر المجاني 0.01 دولار
+- التحقق من X أو موقع (أحدهما كافٍ)
+- تخزين الحالة في SQLite
 """
 
 import asyncio
@@ -38,13 +38,12 @@ from buyer import (
 
 load_dotenv()
 
-# ======================== إعدادات البيئة ========================
+# ======================== إعدادات البيئة (من الكود الأصلي) ========================
 
 OPENSEA_API_KEY = os.environ["OPENSEA_API_KEY"]
 BOT_ENABLED = os.environ.get("BOT_ENABLED", "false").lower() == "true"
-CHECK_WEBSITE = os.environ.get("CHECK_WEBSITE", "true").lower() == "true"
 
-# المحافظ والمفاتيح
+# المحافظ والمفاتيح (من الكود الأصلي)
 PRIVATE_KEYS = [k.strip() for k in os.environ.get("PRIVATE_KEYS", "").split(",") if k.strip()]
 WALLETS = [w.strip() for w in os.environ.get("WALLETS", "").split(",") if w.strip()]
 TELEGRAM_BOT_TOKENS = [t.strip() for t in os.environ.get("TELEGRAM_BOT_TOKENS", "").split(",") if t.strip()]
@@ -63,7 +62,7 @@ WALLETS_DATA = [
     for i in range(len(WALLETS))
 ]
 
-# ======================== إعدادات الشبكات ========================
+# ======================== إعدادات الشبكات (من الكود الأصلي) ========================
 
 ALCHEMY_API_KEY_ROBINHOOD = os.environ["ALCHEMY_API_KEY"]
 ALCHEMY_API_KEY_ETHEREUM = os.environ["ALCHEMY_API_KEY_ETHEREUM"]
@@ -73,26 +72,23 @@ CHAIN_CONFIGS = {
         "stream_chain_name": "robinhood",
         "rpc_url": f"https://robinhood-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY_ROBINHOOD}",
         "max_gas_fee_usd": MAX_GAS_FEE_USD,
-        "label": "🟣 Robinhood Chain",
-        "emoji": "🟣"
+        "label": "Robinhood Chain"
     },
     "ethereum": {
         "stream_chain_name": "ethereum",
         "rpc_url": f"https://eth-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY_ETHEREUM}",
         "max_gas_fee_usd": MAX_GAS_FEE_USD,
-        "label": "🔵 Ethereum Mainnet",
-        "emoji": "🔵"
+        "label": "Ethereum Mainnet"
     },
 }
 
 W3_INSTANCES = {key: get_web3(cfg["rpc_url"]) for key, cfg in CHAIN_CONFIGS.items()}
 STREAM_NAME_TO_CHAIN_KEY = {cfg["stream_chain_name"]: key for key, cfg in CHAIN_CONFIGS.items()}
 
-# ======================== الثوابت ========================
+# ======================== الثوابت (من الكود الأصلي) ========================
 
 STREAM_URL = f"wss://stream.openseabeta.com/socket/websocket?token={OPENSEA_API_KEY}&vsn=2.0.0"
 DROPS_API_BASE = "https://api.opensea.io/api/v2/drops"
-COLLECTION_API_BASE = "https://api.opensea.io/api/v2/collections"
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 LOCAL_TZ = timezone(timedelta(hours=3))
 
@@ -111,7 +107,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("auto-buyer")
 
-# ======================== المتغيرات العالمية ========================
+# ======================== المتغيرات العالمية (من الكود الأصلي) ========================
 
 send_queue: asyncio.Queue[Dict[str, str]] = asyncio.Queue()
 successful_mints: Dict[str, Set[str]] = {}
@@ -234,129 +230,62 @@ def remove_rejected_cooldown(slug: str):
             conn.commit()
 
 
-# ======================== دوال محسنة لجلب X والموقع ========================
+# ======================== دوال جلب X والموقع (من الكود الأصلي) ========================
 
-def get_collection_details(slug: str, api_key: str) -> Optional[Dict[str, Any]]:
-    """
-    جلب تفاصيل المجموعة من OpenSea
-    هذه الدالة تجلب جميع البيانات في طلب واحد
-    """
+def get_twitter_username_from_opensea(slug: str, api_key: str) -> Optional[str]:
+    """الحصول على اسم حساب X (تويتر) من OpenSea - كما في الكود الأصلي"""
     try:
-        url = f"{COLLECTION_API_BASE}/{slug}"
+        url = f"https://api.opensea.io/api/v2/collections/{slug}"
         headers = {"x-api-key": api_key}
-        log.info(f"[API] جلب تفاصيل {slug} من {url}")
-        
         resp = requests.get(url, headers=headers, timeout=10)
         
         if resp.status_code == 200:
             data = resp.json()
             collection = data.get("collection", {})
-            log.info(f"[API] ✅ تم جلب تفاصيل {slug} بنجاح")
-            return collection
-        elif resp.status_code == 404:
-            log.warning(f"[API] ❌ المجموعة {slug} غير موجودة")
-            return None
-        else:
-            log.warning(f"[API] ⚠️ خطأ {resp.status_code} لجلب {slug}")
-            return None
             
-    except requests.exceptions.Timeout:
-        log.warning(f"[API] ⏰ انتهى الوقت لجلب {slug}")
-        return None
-    except Exception as e:
-        log.warning(f"[API] ❌ خطأ لجلب {slug}: {e}")
-        return None
-
-
-def get_twitter_username_from_opensea(slug: str, api_key: str) -> Optional[str]:
-    """
-    الحصول على اسم حساب X (تويتر) من OpenSea
-    """
-    try:
-        collection = get_collection_details(slug, api_key)
-        if not collection:
-            return None
-        
-        # محاولة الحصول من عدة مصادر
-        twitter_username = None
-        
-        # 1. من حقل twitter_username
-        if collection.get("twitter_username"):
+            # كما في الكود الأصلي
             twitter_username = collection.get("twitter_username")
-            log.info(f"[X] ✅ وجدت حساب X: @{twitter_username}")
-            return twitter_username
-        
-        # 2. من external_url
-        external_url = collection.get("external_url", "")
-        if external_url:
+            if twitter_username:
+                return twitter_username
+            
+            external_url = collection.get("external_url", "")
             if "twitter.com" in external_url or "x.com" in external_url:
-                # استخراج اسم المستخدم من الرابط
                 parts = external_url.split("/")
                 if parts:
-                    twitter_username = parts[-1]
-                    if twitter_username:
-                        log.info(f"[X] ✅ وجدت حساب X من الرابط: @{twitter_username}")
-                        return twitter_username
+                    return parts[-1]
         
-        # 3. من community_data
-        community = collection.get("community_data", {})
-        if community.get("twitter_username"):
-            twitter_username = community.get("twitter_username")
-            log.info(f"[X] ✅ وجدت حساب X من المجتمع: @{twitter_username}")
-            return twitter_username
-        
-        log.info(f"[X] ❌ لم يتم العثور على حساب X لـ {slug}")
         return None
-        
     except Exception as e:
-        log.warning(f"[X] ❌ خطأ لجلب حساب X لـ {slug}: {e}")
+        log.warning(f"[X] خطأ لجلب حساب X لـ {slug}: {e}")
         return None
 
 
 def get_website_from_opensea(slug: str, api_key: str) -> Optional[str]:
-    """
-    الحصول على الموقع الإلكتروني من OpenSea
-    """
+    """الحصول على الموقع الإلكتروني من OpenSea"""
     try:
-        collection = get_collection_details(slug, api_key)
-        if not collection:
-            return None
+        url = f"https://api.opensea.io/api/v2/collections/{slug}"
+        headers = {"x-api-key": api_key}
+        resp = requests.get(url, headers=headers, timeout=10)
         
-        website = None
-        
-        # 1. من external_url
-        external_url = collection.get("external_url", "")
-        if external_url and external_url.startswith(("http://", "https://")):
-            # التأكد من أنه ليس رابط تويتر
-            if "twitter.com" not in external_url and "x.com" not in external_url:
-                website = external_url
-                log.info(f"[موقع] ✅ وجدت موقع: {website}")
+        if resp.status_code == 200:
+            data = resp.json()
+            collection = data.get("collection", {})
+            
+            website = collection.get("external_url")
+            if website and website.startswith(("http://", "https://")):
                 return website
+            
+            project_website = collection.get("project_website")
+            if project_website and project_website.startswith(("http://", "https://")):
+                return project_website
         
-        # 2. من project_website
-        project_website = collection.get("project_website", "")
-        if project_website and project_website.startswith(("http://", "https://")):
-            website = project_website
-            log.info(f"[موقع] ✅ وجدت موقع المشروع: {website}")
-            return website
-        
-        # 3. من community_data
-        community = collection.get("community_data", {})
-        if community.get("website"):
-            website = community.get("website")
-            if website.startswith(("http://", "https://")):
-                log.info(f"[موقع] ✅ وجدت موقع من المجتمع: {website}")
-                return website
-        
-        log.info(f"[موقع] ❌ لم يتم العثور على موقع لـ {slug}")
         return None
-        
     except Exception as e:
-        log.warning(f"[موقع] ❌ خطأ لجلب الموقع لـ {slug}: {e}")
+        log.warning(f"[الموقع] خطأ لجلب الموقع لـ {slug}: {e}")
         return None
 
 
-# ======================== الدوال المساعدة ========================
+# ======================== الدوال المساعدة (من الكود الأصلي) ========================
 
 def get_eth_price_usd() -> float:
     """الحصول على سعر ETH مع التخزين المؤقت"""
@@ -437,7 +366,7 @@ def stage_has_ended(stage: Dict[str, Any]) -> bool:
     return datetime.now(timezone.utc) > end
 
 
-# ======================== رسائل التيليجرام المحسنة ========================
+# ======================== رسائل التيليجرام (من الكود الأصلي مع تحسينات) ========================
 
 def enqueue_message(bot_token: str, chat_id: str, text: str):
     """إضافة إشعار جديد"""
@@ -455,32 +384,28 @@ def build_success_msg(detail: Dict[str, Any], result: Dict[str, Any], chain_key:
     name = detail.get("collection_name") or detail.get("collection_slug") or "غير معروف"
     url = detail.get("opensea_url", "")
     chain_label = CHAIN_CONFIGS[chain_key]["label"]
-    chain_emoji = CHAIN_CONFIGS[chain_key]["emoji"]
     w_short = result['wallet'][:6] + "..." + result['wallet'][-4:]
     
     price_usd = (result.get('total_value_wei', 0) / 1e18) * get_eth_price_usd() if result.get('total_value_wei') else 0
     
     msg = (
-        f"🟢 <b>✅ تم الشراء بنجاح!</b>\n"
-        f"{'═' * 30}\n"
-        f"{chain_emoji} <b>السلسلة:</b> {chain_label}\n"
-        f"🆔 <b>المجموعة:</b> <a href='{url}'>{name}</a>\n"
-        f"👛 <b>المحفظة:</b> <code>{w_short}</code>\n"
-        f"📦 <b>الكمية:</b> {result['quantity']}\n"
-        f"💰 <b>سعر التوكن:</b> ${price_usd:.4f}\n"
-        f"⛽ <b>رسوم الغاز:</b> ${result['gas_fee_usd']:.4f} (حد: ${MAX_GAS_FEE_USD})\n"
-        f"📊 <b>وحدات الغاز:</b> {result.get('gas_units', 'N/A')}\n"
+        f"✅ <b>تم الشراء بنجاح!</b> ({chain_label})\n\n"
+        f"المحفظة: <code>{w_short}</code>\n"
+        f"المجموعة: <b>{name}</b>\n"
+        f"الكمية: {result['quantity']}\n"
+        f"سعر التوكن: ${price_usd:.4f}\n"
+        f"رسوم الغاز: ${result['gas_fee_usd']:.4f} (حد: ${MAX_GAS_FEE_USD})\n"
     )
     
     if twitter:
-        msg += f"🐦 <b>X:</b> @{twitter}\n"
+        msg += f"X: @{twitter}\n"
     
     if website:
-        msg += f"🌐 <b>الموقع:</b> <a href='{website}'>{website}</a>\n"
+        msg += f"الموقع: {website}\n"
     
     msg += (
-        f"🔗 <b>المعاملة:</b> <code>{result['tx_hash'][:10]}...{result['tx_hash'][-8:]}</code>\n"
-        f"{'═' * 30}"
+        f"المعاملة: <code>{result['tx_hash'][:10]}...{result['tx_hash'][-8:]}</code>\n"
+        f"🔗 {url}"
     )
     
     return msg
@@ -492,94 +417,54 @@ def build_watching_msg(detail: Dict[str, Any], reason: str, price_usd: float = N
     url = detail.get("opensea_url", "")
     
     msg = (
-        f"👀 <b>🔍 جارٍ مراقبة المينت</b>\n"
-        f"{'═' * 30}\n"
-        f"🆔 <b>المجموعة:</b> <a href='{url}'>{name}</a>\n"
+        f"👀 <b>تحت المراقبة</b>\n\n"
+        f"المجموعة: <b>{name}</b>\n"
     )
     
     if price_usd is not None:
-        msg += f"💰 <b>السعر الحالي:</b> ${price_usd:.4f}\n"
+        msg += f"السعر الحالي: ${price_usd:.4f}\n"
     
-    msg += f"📝 <b>السبب:</b> {reason}\n"
+    msg += f"السبب: {reason}\n"
     
     if twitter:
-        msg += f"🐦 <b>X:</b> @{twitter}\n"
+        msg += f"X: @{twitter}\n"
     
     if website:
-        msg += f"🌐 <b>الموقع:</b> <a href='{website}'>{website}</a>\n"
+        msg += f"الموقع: {website}\n"
     
-    msg += (
-        f"📊 <b>حد السعر المجاني:</b> ${FREE_PRICE_THRESHOLD_USD:.4f}\n"
-        f"⏳ <b>الحالة:</b> في انتظار تحول السعر إلى مجاني\n"
-        f"{'═' * 30}\n"
-        f"💡 سيتم الشراء تلقائياً فور وصول السعر إلى ${FREE_PRICE_THRESHOLD_USD:.4f} أو أقل"
-    )
+    msg += f"حد السعر المجاني: ${FREE_PRICE_THRESHOLD_USD:.4f}\n"
+    msg += f"سنحاول الشراء تلقائيًا فور توفر الفرصة."
     
     return msg
 
 
-def build_gaveup_msg(detail: Dict[str, Any], reason: str, twitter: str = None, website: str = None) -> str:
+def build_gaveup_msg(detail: Dict[str, Any], reason: str) -> str:
     """بناء رسالة انتهاء الفرصة"""
     name = detail.get("collection_name") or detail.get("collection_slug") or "غير معروف"
-    url = detail.get("opensea_url", "")
-    
-    msg = (
-        f"🔴 <b>❌ انتهت الفرصة</b>\n"
-        f"{'═' * 30}\n"
-        f"🆔 <b>المجموعة:</b> <a href='{url}'>{name}</a>\n"
-        f"📝 <b>السبب:</b> {reason}\n"
-    )
-    
-    if twitter:
-        msg += f"🐦 <b>X:</b> @{twitter}\n"
-    
-    if website:
-        msg += f"🌐 <b>الموقع:</b> <a href='{website}'>{website}</a>\n"
-    
-    msg += f"{'═' * 30}\n"
-    msg += f"⏰ تمت إزالة المشروع من قائمة المراقبة"
-    
-    return msg
+    return f"❌ <b>انتهت الفرصة</b>\n\nالمجموعة: <b>{name}</b>\nالسبب: {reason}"
 
 
-def build_gas_alert_msg(slug: str, gas_fee_usd: float, twitter: str = None, website: str = None) -> str:
+def build_gas_alert_msg(slug: str, gas_fee_usd: float) -> str:
     """بناء رسالة تنبيه الغاز"""
-    msg = (
-        f"⚠️ <b>⚡ تنبيه: رسوم الغاز مرتفعة!</b>\n"
-        f"{'═' * 30}\n"
-        f"🆔 <b>المشروع:</b> {slug}\n"
-        f"⛽ <b>رسوم الغاز المقدرة:</b> ${gas_fee_usd:.4f}\n"
-        f"⛔ <b>الحد الأقصى المسموح:</b> ${MAX_GAS_FEE_USD}\n"
+    return (
+        f"⚠️ <b>تنبيه: رسوم الغاز مرتفعة!</b>\n\n"
+        f"المشروع: <b>{slug}</b>\n"
+        f"رسوم الغاز: ${gas_fee_usd:.4f}\n"
+        f"الحد الأقصى: ${MAX_GAS_FEE_USD}\n"
+        f"❌ تم تخطي المعاملة للحماية"
     )
-    
-    if twitter:
-        msg += f"🐦 <b>X:</b> @{twitter}\n"
-    
-    if website:
-        msg += f"🌐 <b>الموقع:</b> <a href='{website}'>{website}</a>\n"
-    
-    msg += (
-        f"{'═' * 30}\n"
-        f"🛡️ تم تخطي المعاملة لحماية محفظتك من الرسوم المرتفعة"
-    )
-    
-    return msg
 
 
 def build_startup_msg() -> str:
     """بناء رسالة بدء التشغيل"""
     wallet_count = len(WALLETS_DATA)
     return (
-        f"🚀 <b>تم تشغيل البوت بنجاح!</b>\n"
-        f"{'═' * 30}\n"
-        f"👛 <b>عدد المحافظ:</b> {wallet_count}\n"
-        f"⛽ <b>حد الغاز الأقصى:</b> ${MAX_GAS_FEE_USD}\n"
-        f"💰 <b>حد السعر المجاني:</b> ${FREE_PRICE_THRESHOLD_USD:.4f}\n"
-        f"🔍 <b>التحقق من X:</b> ✅ مفعل\n"
-        f"🌐 <b>التحقق من الموقع:</b> {'✅ مفعل' if CHECK_WEBSITE else '❌ معطل'}\n"
-        f"📌 <b>سياسة الشراء:</b> يتطلب X أو موقع (أحدهما كافٍ)\n"
-        f"{'═' * 30}\n"
-        f"👀 جارٍ مراقبة المينتات التي يقل سعرها عن ${FREE_PRICE_THRESHOLD_USD:.4f}..."
+        f"🚀 <b>تم تشغيل البوت بنجاح!</b>\n\n"
+        f"عدد المحافظ: {wallet_count}\n"
+        f"حد الغاز الأقصى: ${MAX_GAS_FEE_USD}\n"
+        f"حد السعر المجاني: ${FREE_PRICE_THRESHOLD_USD:.4f}\n"
+        f"سياسة الشراء: يتطلب X أو موقع (أحدهما كافٍ)\n\n"
+        f"👀 جارٍ مراقبة المينتات..."
     )
 
 
@@ -608,7 +493,7 @@ async def telegram_sender():
             continue
 
 
-# ======================== الشراء المتوازي ========================
+# ======================== الشراء المتوازي (من الكود الأصلي) ========================
 
 async def purchase_task_for_wallet(
     w3, item: Dict[str, Any], slug: str, contract_address: str,
@@ -654,7 +539,7 @@ async def purchase_task_for_wallet(
             enqueue_message(bot_token, chat_id, msg)
             
         elif res.get("reason") in ["gas_price_too_high", "gas_exceeds_limit"]:
-            msg = build_gas_alert_msg(slug, res.get("gas_fee_usd", 0.0), twitter, website)
+            msg = build_gas_alert_msg(slug, res.get("gas_fee_usd", 0.0))
             enqueue_message(bot_token, chat_id, msg)
 
         return res
@@ -693,6 +578,7 @@ async def try_buy_now_multi_wallet(
     onchain_price = await asyncio.to_thread(get_onchain_public_price_wei, w3, contract_address)
     price_wei = onchain_price if onchain_price is not None else int(stage.get("price", "0"))
 
+    # التحقق من السعر المجاني (0.01 دولار)
     if not is_free_or_negligible(price_wei, eth_price_usd):
         return None
 
@@ -719,10 +605,10 @@ async def try_buy_now_multi_wallet(
     return await asyncio.gather(*tasks)
 
 
-# ======================== تقييم المينتات ========================
+# ======================== تقييم المينتات (من الكود الأصلي مع تحسين الشرط) ========================
 
 async def evaluate_new_mint(slug: str, chain_key: str):
-    """تقييم مينت جديد مع التحقق من X والموقع"""
+    """تقييم مينت جديد - يتطلب X أو موقع (أحدهما كافٍ)"""
     if (
         len(successful_mints.get(slug, set())) >= len(WALLETS_DATA)
         or slug in watchlist
@@ -735,64 +621,32 @@ async def evaluate_new_mint(slug: str, chain_key: str):
     try:
         found, detail = await asyncio.to_thread(fetch_drop_detail, slug)
         if not found or not detail or not detail.get("is_minting"):
-            in_flight.discard(slug)
             return
 
         stage = detail.get("active_stage")
         if not stage or not started_today_local(stage):
-            in_flight.discard(slug)
             return
 
         # ======================== التحقق من X والموقع (أحدهما كافٍ) ========================
-        log.info(f"[{slug}] 🔍 جاري التحقق من X والموقع...")
         
-        # 1. جلب تفاصيل المجموعة (مرة واحدة للكل)
-        collection = await asyncio.to_thread(get_collection_details, slug, OPENSEA_API_KEY)
+        # 1. التحقق من وجود حساب X (تويتر) - كما في الكود الأصلي
+        twitter_username = await asyncio.to_thread(get_twitter_username_from_opensea, slug, OPENSEA_API_KEY)
         
-        # 2. استخراج X
-        twitter_username = None
-        if collection:
-            # محاولة من عدة مصادر
-            twitter_username = collection.get("twitter_username")
-            if not twitter_username:
-                external_url = collection.get("external_url", "")
-                if "twitter.com" in external_url or "x.com" in external_url:
-                    parts = external_url.split("/")
-                    if parts:
-                        twitter_username = parts[-1]
-            if not twitter_username:
-                community = collection.get("community_data", {})
-                twitter_username = community.get("twitter_username")
-        
-        # 3. استخراج الموقع
-        website = None
-        if collection and CHECK_WEBSITE:
-            website = collection.get("external_url", "")
-            if website and not website.startswith(("http://", "https://")):
-                website = None
-            if not website:
-                website = collection.get("project_website", "")
-                if website and not website.startswith(("http://", "https://")):
-                    website = None
-            if not website:
-                community = collection.get("community_data", {})
-                website = community.get("website", "")
-                if website and not website.startswith(("http://", "https://")):
-                    website = None
+        # 2. التحقق من وجود موقع إلكتروني
+        website = await asyncio.to_thread(get_website_from_opensea, slug, OPENSEA_API_KEY)
 
+        # التحقق: يجب أن يكون لدينا X أو موقع
         has_twitter = bool(twitter_username)
-        has_website = bool(website) if CHECK_WEBSITE else True
-        
-        log.info(f"[{slug}] 📊 X: {twitter_username if has_twitter else '❌'}, موقع: {website if has_website else '❌'}")
+        has_website = bool(website)
         
         if not (has_twitter or has_website):
             log.info(f"⏭️ تجاهل '{slug}': لا يوجد X ولا موقع")
             mark_rejected(slug)
             msg = build_watching_msg(detail, "لا يوجد حساب X ولا موقع إلكتروني")
             broadcast_message(msg)
-            in_flight.discard(slug)
             return
         
+        # سجل ما تم العثور عليه
         found_parts = []
         if has_twitter:
             found_parts.append(f"X: @{twitter_username}")
@@ -807,7 +661,6 @@ async def evaluate_new_mint(slug: str, chain_key: str):
         if contract_address:
             is_active, _ = await asyncio.to_thread(is_mint_active, w3, contract_address)
             if not is_active:
-                in_flight.discard(slug)
                 return
             
             onchain_price = await asyncio.to_thread(get_onchain_public_price_wei, w3, contract_address)
@@ -815,6 +668,7 @@ async def evaluate_new_mint(slug: str, chain_key: str):
             
             price_usd = (price_wei / 1e18) * eth_price_usd
             
+            # إذا كان المينت مدفوعاً، ضعه في قائمة المراقبة
             if not is_free_or_negligible(price_wei, eth_price_usd):
                 if slug not in watchlist:
                     watchlist[slug] = {"chain_key": chain_key, "detail": detail}
@@ -827,7 +681,6 @@ async def evaluate_new_mint(slug: str, chain_key: str):
                         website if has_website else None
                     )
                     broadcast_message(msg)
-                in_flight.discard(slug)
                 return
 
         # محاولة الشراء
@@ -848,7 +701,6 @@ async def evaluate_new_mint(slug: str, chain_key: str):
                     website=website if has_website else None
                 )
                 broadcast_message(msg)
-            in_flight.discard(slug)
             return
 
         if len(successful_mints.get(slug, set())) < len(WALLETS_DATA):
@@ -865,7 +717,7 @@ async def evaluate_new_mint(slug: str, chain_key: str):
         in_flight.discard(slug)
 
 
-# ======================== حلقة المراقبة ========================
+# ======================== حلقة المراقبة (من الكود الأصلي) ========================
 
 async def watch_loop():
     """مراقبة المينتات المدفوعة"""
@@ -893,7 +745,6 @@ async def watch_loop():
                     watchlist.pop(slug, None)
                     remove_from_watchlist(slug)
                     broadcast_message(build_gaveup_msg(entry["detail"], "المينت لم يعد نشطاً"))
-                    in_flight.discard(slug)
                     continue
 
                 stage = fresh_detail.get("active_stage")
@@ -901,38 +752,17 @@ async def watch_loop():
                     watchlist.pop(slug, None)
                     remove_from_watchlist(slug)
                     broadcast_message(build_gaveup_msg(fresh_detail, "انتهت المرحلة"))
-                    in_flight.discard(slug)
                     continue
 
                 # جلب المعلومات مرة أخرى
-                collection = await asyncio.to_thread(get_collection_details, slug, OPENSEA_API_KEY)
-                twitter_username = None
-                website = None
-                
-                if collection:
-                    twitter_username = collection.get("twitter_username")
-                    if not twitter_username:
-                        external_url = collection.get("external_url", "")
-                        if "twitter.com" in external_url or "x.com" in external_url:
-                            parts = external_url.split("/")
-                            if parts:
-                                twitter_username = parts[-1]
-                    
-                    if CHECK_WEBSITE:
-                        website = collection.get("external_url", "")
-                        if website and not website.startswith(("http://", "https://")):
-                            website = None
-                        if not website:
-                            website = collection.get("project_website", "")
-                            if website and not website.startswith(("http://", "https://")):
-                                website = None
+                twitter_username = await asyncio.to_thread(get_twitter_username_from_opensea, slug, OPENSEA_API_KEY)
+                website = await asyncio.to_thread(get_website_from_opensea, slug, OPENSEA_API_KEY)
 
                 results = await try_buy_now_multi_wallet(slug, chain_key, fresh_detail, twitter_username, website)
 
                 if results is None:
                     watchlist[slug] = {"chain_key": chain_key, "detail": fresh_detail}
                     save_watchlist(slug, chain_key, fresh_detail)
-                    in_flight.discard(slug)
                     continue
 
                 if len(successful_mints.get(slug, set())) >= len(WALLETS_DATA):
@@ -948,7 +778,7 @@ async def watch_loop():
                 in_flight.discard(slug)
 
 
-# ======================== الاتصال بـ OpenSea ========================
+# ======================== الاتصال بـ OpenSea (من الكود الأصلي) ========================
 
 async def listen_opensea():
     """الاستماع لأحداث OpenSea"""
@@ -1028,7 +858,6 @@ async def run():
     log.info(f"✅ تم التحميل: {len(successful_mints)} مينت, {len(watchlist)} مراقبة")
     log.info(f"💰 حد الغاز: ${MAX_GAS_FEE_USD}")
     log.info(f"💰 حد السعر المجاني: ${FREE_PRICE_THRESHOLD_USD:.4f}")
-    log.info(f"🌐 التحقق من الموقع: {'مفعل' if CHECK_WEBSITE else 'معطل'}")
     log.info(f"📌 سياسة الشراء: يتطلب X أو موقع (أحدهما كافٍ)")
     
     broadcast_message(build_startup_msg())
