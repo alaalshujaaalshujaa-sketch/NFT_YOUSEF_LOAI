@@ -140,7 +140,6 @@ def estimate_gas_fee_usd(
     """تقدير رسوم الغاز بالدولار"""
     try:
         if use_eip1559:
-            # محاولة استخدام EIP-1559
             try:
                 latest_block = w3.eth.get_block('latest')
                 base_fee = latest_block.get('baseFeePerGas', None)
@@ -153,7 +152,6 @@ def estimate_gas_fee_usd(
             except:
                 pass
         
-        # Fallback للغاز العادي
         gas_price_wei = w3.eth.gas_price
         fee_eth = (gas_price_wei * gas_units) / 1e18
         return fee_eth * eth_price_usd
@@ -191,6 +189,22 @@ def get_onchain_public_price_wei(w3: Web3, nft_contract: str) -> Optional[int]:
         log.warning(f"[سعر on-chain] تعذر القراءة: {e}")
         return None
 
+def get_mint_times(w3: Web3, nft_contract: str) -> Tuple[Optional[int], Optional[int]]:
+    """جلب وقت بداية ونهاية المينت من السلسلة"""
+    try:
+        seadrop = w3.eth.contract(address=SEADROP_ADDRESS, abi=SEADROP_ABI)
+        public_drop = seadrop.functions.getPublicDrop(
+            Web3.to_checksum_address(nft_contract)
+        ).call()
+        
+        start_time = int(public_drop[1]) if len(public_drop) > 1 else None
+        end_time = int(public_drop[2]) if len(public_drop) > 2 else None
+        
+        return start_time, end_time
+    except Exception as e:
+        log.warning(f"[وقت المينت] تعذر القراءة: {e}")
+        return None, None
+
 # ---------------------------------------------------------------------------
 # منطق الكمية
 # ---------------------------------------------------------------------------
@@ -203,10 +217,10 @@ def decide_quantity(
     """تحديد كمية الشراء بناءً على الاستراتيجية"""
     
     strategies = {
-        "conservative": lambda: 1,  # شراء 1 فقط دائماً
-        "moderate": lambda: min(5, max_per_wallet or 5),  # شراء حتى 5
+        "conservative": lambda: 1,
+        "moderate": lambda: min(5, max_per_wallet or 5),
         "aggressive": lambda: max_per_wallet if max_per_wallet and max_per_wallet <= FEW_THRESHOLD else LIMITED_BUY_QTY,
-        "max": lambda: max_per_wallet or remaining_supply,  # شراء الحد الأقصى
+        "max": lambda: max_per_wallet or remaining_supply,
     }
     
     qty = strategies.get(strategy, strategies["moderate"])()
@@ -237,7 +251,6 @@ def build_transaction(
         "chainId": w3.eth.chain_id,
     }
     
-    # إضافة gas price
     if use_eip1559:
         try:
             latest_block = w3.eth.get_block('latest')
@@ -251,9 +264,8 @@ def build_transaction(
         except:
             pass
     
-    # إذا لم يتم استخدام EIP-1559 أو فشل
     if "maxFeePerGas" not in tx_params:
-        gas_price = int(w3.eth.gas_price * 1.2)  # 20% buffer
+        gas_price = int(w3.eth.gas_price * 1.2)
         tx_params["gasPrice"] = gas_price
     
     tx = contract.functions.mintPublic(
@@ -273,6 +285,10 @@ def analyze_transaction_error(error_msg: str) -> str:
     """تحليل رسالة الخطأ لتحديد السبب"""
     
     error_lower = error_msg.lower()
+    
+    # فحص أخطاء الوقت
+    if "0x13da22f2" in error_lower:
+        return "mint_time_error"
     
     if "execution reverted" in error_lower:
         if "mintnotopen" in error_lower or "not open" in error_lower:
@@ -319,6 +335,9 @@ async def purchase_with_retry(
         "no_fee_recipient",
         "sold_out",
         "mint_not_open",
+        "mint_not_started",
+        "mint_ended",
+        "mint_time_error",
         "max_per_wallet_exceeded",
     }
     
@@ -340,17 +359,14 @@ async def purchase_with_retry(
         
         last_result = result
         
-        # نجاح
         if result.get("success"):
             return result
         
-        # فشل دائم - لا تعيد المحاولة
         if result.get("reason") in permanent_failures:
             return result
         
-        # إعادة المحاولة مع backoff
         if attempt < max_retries - 1:
-            delay = retry_delay_base * (2 ** attempt)  # exponential backoff
+            delay = retry_delay_base * (2 ** attempt)
             log.info(
                 f"إعادة المحاولة ({attempt + 1}/{max_retries}) "
                 f"للمحفظة {wallet_address[:8]}... بعد {delay:.1f} ثانية"
@@ -386,6 +402,29 @@ def attempt_purchase_single_wallet(
             "wallet": wallet_address,
             "reason": "invalid_address",
             "error": str(e),
+        }
+    
+    # ✅ فحص وقت المينت
+    start_time, end_time = get_mint_times(w3, checksum_contract)
+    current_time = int(time.time())
+    
+    if start_time and current_time < start_time:
+        wait_seconds = start_time - current_time
+        log.info(f"⏰ المينت يبدأ بعد {wait_seconds} ثانية")
+        return {
+            "success": False,
+            "wallet": checksum_wallet,
+            "reason": "mint_not_started",
+            "error": f"المينت يبدأ بعد {wait_seconds} ثانية",
+        }
+    
+    if end_time and current_time > end_time:
+        log.info(f"⏰ المينت انتهى منذ {current_time - end_time} ثانية")
+        return {
+            "success": False,
+            "wallet": checksum_wallet,
+            "reason": "mint_ended",
+            "error": f"المينت انتهى منذ {current_time - end_time} ثانية",
         }
     
     # فحص الرصيد
@@ -442,6 +481,15 @@ def attempt_purchase_single_wallet(
             tx["gas"] = int(estimated_gas * GAS_LIMIT_SAFETY_MARGIN)
         except Exception as e:
             error_reason = analyze_transaction_error(str(e))
+            
+            # تسجيل تفاصيل أكثر
+            log.error(f"[تقدير الغاز فشل - {checksum_wallet[:8]}] السبب: {error_reason}")
+            log.error(f"  - الوقت الحالي: {datetime.fromtimestamp(current_time)}")
+            if start_time:
+                log.error(f"  - وقت البداية: {datetime.fromtimestamp(start_time)}")
+            if end_time:
+                log.error(f"  - وقت النهاية: {datetime.fromtimestamp(end_time)}")
+            
             return {
                 "success": False,
                 "wallet": checksum_wallet,
@@ -486,7 +534,7 @@ def attempt_purchase_single_wallet(
     
     except Exception as e:
         error_reason = analyze_transaction_error(str(e))
-        log.error(f"[خطأ إرسال للمحفظة {checksum_wallet[:8]}] {e}")
+        log.error(f"[خطأ إرسال للمحفظة {checksum_wallet[:8]}] السبب: {error_reason}")
         return {
             "success": False,
             "wallet": checksum_wallet,
