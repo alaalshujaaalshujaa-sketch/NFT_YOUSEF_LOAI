@@ -1,5 +1,10 @@
 """
-النظام الكامل — فحص مسبق + نوم ذكي + شراء فوري + مراقبة المراحل المجانية
+النظام الكامل — سرعة قصوى لاكتشاف وشراء المينتات:
+  - استخدام بيانات WebSocket مباشرة (بدون API calls)
+  - قراءة blockchain واحدة فقط
+  - فحص مسبق للمينتات القادمة
+  - شراء فوري عند التفعيل
+  - إشعارات بسيطة: بدء + شراء
 """
 
 import asyncio
@@ -7,7 +12,6 @@ import json
 import logging
 import os
 import time
-from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List, Tuple, Set
 from dataclasses import dataclass, field
 from enum import Enum
@@ -19,7 +23,6 @@ from web3 import Web3
 
 from buyer import (
     get_web3,
-    attempt_purchase_single_wallet,
     get_onchain_public_price_wei,
     get_mint_times,
     LockManager,
@@ -44,8 +47,6 @@ class ChainConfig:
     stream_chain_name: str
     rpc_url: str
     max_gas_fee_usd: float
-    max_retries: int = 3
-    retry_delay_base: float = 1.0
 
 @dataclass
 class WalletConfig:
@@ -57,19 +58,17 @@ class WalletConfig:
     current_detail: Dict[str, Any] = field(default_factory=dict)
 
 @dataclass
-class WatchlistEntry:
+class PendingMint:
+    """مينت قادم تم فحصه مسبقاً"""
+    slug: str
     chain_key: str
-    detail: Dict[str, Any]
+    contract_address: str
+    start_time: int
+    end_time: Optional[int]
+    twitter_username: Optional[str]
+    collection_name: str
+    opensea_url: str
     added_at: float
-    twitter_checked: bool = False
-    twitter_username: Optional[str] = None
-    mint_status: MintStatus = MintStatus.UNKNOWN
-    mint_start_time: Optional[int] = None
-    mint_end_time: Optional[int] = None
-    is_free: bool = False
-    start_notified: bool = False
-    last_price_check: float = 0
-    price_check_count: int = 0
 
 class Config:
     def __init__(self):
@@ -98,8 +97,8 @@ class Config:
         self.recv_timeout = int(self._get_env("RECV_TIMEOUT", "5"))
         self.free_price_threshold = float(self._get_env("FREE_PRICE_THRESHOLD", "0.01"))
         
-        self.notify_before_start = 43200  # 12 ساعة
-        self.price_check_interval = 60  # ✅ فحص السعر كل 60 ثانية للمينتات المدفوعة
+        # إشعار قبل 12 ساعة
+        self.notify_before_start = 43200
         
     def _get_env(self, key: str, default: str = "", required: bool = False) -> str:
         value = os.environ.get(key, default).strip()
@@ -143,18 +142,20 @@ stream_name_to_chain = {cfg.stream_chain_name: key for key, cfg in config.chains
 
 lock_manager = LockManager()
 
+# ✅ تتبع مبسط وسريع
+pending_mints: Dict[str, PendingMint] = {}
 successful_mints: Dict[str, set] = {}
-watchlist: Dict[str, WatchlistEntry] = {}
+processed_slugs: Set[str] = set()
 in_flight: Set[str] = set()
-known_slugs: Set[str] = set()
 
 _eth_price_cache = {"value": None, "ts": 0, "ttl": 300}
 
 # ---------------------------------------------------------------------------
-# دوال مساعدة
+# دوال مساعدة سريعة
 # ---------------------------------------------------------------------------
 
 def get_eth_price_usd() -> float:
+    """جلب سعر ETH مع cache سريع"""
     now = time.time()
     if _eth_price_cache["value"] and (now - _eth_price_cache["ts"] < _eth_price_cache["ttl"]):
         return _eth_price_cache["value"]
@@ -162,7 +163,7 @@ def get_eth_price_usd() -> float:
     try:
         resp = requests.get(
             "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd",
-            timeout=8,
+            timeout=5,
         )
         price = float(resp.json()["ethereum"]["usd"])
         _eth_price_cache.update({"value": price, "ts": now})
@@ -173,48 +174,23 @@ def get_eth_price_usd() -> float:
 def calculate_price_usd(price_wei: int, eth_price_usd: float) -> float:
     return (price_wei / 1e18) * eth_price_usd
 
-def get_mint_status(w3: Web3, contract_address: str) -> Tuple[MintStatus, Optional[int], Optional[int]]:
-    try:
-        start_time, end_time = get_mint_times(w3, contract_address)
-        current_time = int(time.time())
-        
-        if start_time and current_time < start_time:
-            return MintStatus.NOT_STARTED, start_time, end_time
-        if end_time and current_time > end_time:
-            return MintStatus.ENDED, start_time, end_time
-        if start_time and end_time:
-            return MintStatus.ACTIVE, start_time, end_time
-        
-        return MintStatus.UNKNOWN, start_time, end_time
-    except:
-        return MintStatus.UNKNOWN, None, None
+def is_free_or_negligible(price_wei: int, eth_price_usd: float) -> bool:
+    return calculate_price_usd(price_wei, eth_price_usd) < config.free_price_threshold
 
-# ---------------------------------------------------------------------------
-# API OpenSea
-# ---------------------------------------------------------------------------
-
-class OpenSeaAPI:
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-        self.base_url = "https://api.opensea.io/api/v2"
+def format_time(wait_seconds: int) -> str:
+    hours = wait_seconds // 3600
+    minutes = (wait_seconds % 3600) // 60
+    secs = wait_seconds % 60
     
-    def fetch_drop_detail(self, slug: str) -> Tuple[bool, Optional[Dict]]:
-        try:
-            resp = requests.get(
-                f"{self.base_url}/drops/{slug}",
-                headers={"x-api-key": self.api_key},
-                timeout=10,
-            )
-            if resp.status_code == 200:
-                return True, resp.json()
-            return False, None
-        except:
-            return None, None
-
-opensea_api = OpenSeaAPI(config.opensea_api_key)
+    if hours > 0:
+        return f"{hours} ساعة و {minutes} دقيقة" if minutes > 0 else f"{hours} ساعة"
+    elif minutes > 0:
+        return f"{minutes} دقيقة"
+    else:
+        return f"{secs} ثانية"
 
 # ---------------------------------------------------------------------------
-# تيليجرام
+# تيليجرام سريع
 # ---------------------------------------------------------------------------
 
 class TelegramManager:
@@ -248,148 +224,50 @@ class TelegramManager:
                     requests.post,
                     f"{telegram_api}/sendMessage",
                     data={"chat_id": msg["chat_id"], "text": msg["text"], "parse_mode": "HTML", "disable_web_page_preview": False},
-                    timeout=10,
+                    timeout=5,
                 )
                 self.send_queue.task_done()
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.05)  # أسرع إرسال
             except asyncio.CancelledError:
                 break
             except:
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.5)
 
 telegram_manager = TelegramManager()
 
 # ---------------------------------------------------------------------------
-# رسائل
+# رسائل سريعة
 # ---------------------------------------------------------------------------
 
-def get_opensea_url(detail: dict) -> str:
-    url = detail.get("opensea_url", "")
-    if url:
-        return url
-    slug = detail.get("collection_slug") or ""
-    if slug:
-        return f"https://opensea.io/collection/{slug}"
-    return ""
-
-def format_time(wait_seconds: int) -> str:
-    hours = wait_seconds // 3600
-    minutes = (wait_seconds % 3600) // 60
-    secs = wait_seconds % 60
-    
-    if hours > 0:
-        return f"{hours} ساعة و {minutes} دقيقة" if minutes > 0 else f"{hours} ساعة"
-    elif minutes > 0:
-        return f"{minutes} دقيقة"
-    else:
-        return f"{secs} ثانية"
-
-def build_start_notification(detail: dict, wait_seconds: int) -> str:
-    name = detail.get("collection_name") or detail.get("collection_slug", "Unknown")
-    url = get_opensea_url(detail)
+def build_start_notification(collection_name: str, opensea_url: str, wait_seconds: int) -> str:
     time_str = format_time(wait_seconds)
-    
-    msg = f"🔔 <b>مينت قادم!</b>\n\nالمجموعة: <b>{name}</b>\nيبدأ خلال: {time_str}"
-    if url:
-        msg += f"\n\n🔗 <a href='{url}'>OpenSea</a>"
+    msg = f"🔔 <b>مينت قادم!</b>\n\nالمجموعة: <b>{collection_name}</b>\nيبدأ خلال: {time_str}"
+    if opensea_url:
+        msg += f"\n\n🔗 <a href='{opensea_url}'>OpenSea</a>"
     return msg
 
-def build_free_stage_notification(detail: dict) -> str:
-    """✅ إشعار فتح مرحلة مجانية"""
-    name = detail.get("collection_name") or detail.get("collection_slug", "Unknown")
-    url = get_opensea_url(detail)
-    
-    msg = f"🎉 <b>فتحت مرحلة مجانية!</b>\n\nالمجموعة: <b>{name}</b>\nجاري الشراء..."
-    if url:
-        msg += f"\n\n🔗 <a href='{url}'>OpenSea</a>"
-    return msg
-
-def build_success_message(wallet_config: WalletConfig, result: dict, detail: dict) -> str:
-    name = detail.get("collection_name") or detail.get("collection_slug", "Unknown")
-    url = get_opensea_url(detail)
-    chain = "Robinhood" if wallet_config.chain_key == "robinhood" else "Ethereum"
-    wallet_short = f"{wallet_config.wallet[:6]}...{wallet_config.wallet[-4:]}"
-    
-    msg = f"✅ <b>تم الشراء!</b> ({chain})\n\nالمحفظة: <code>{wallet_short}</code>\nالمجموعة: <b>{name}</b>\nالكمية: {result.get('quantity', 0)}"
-    if url:
-        msg += f"\n\n🔗 <a href='{url}'>OpenSea</a>"
+def build_success_message(wallet_short: str, collection_name: str, opensea_url: str, chain_label: str, quantity: int) -> str:
+    msg = f"✅ <b>تم الشراء!</b> ({chain_label})\n\nالمحفظة: <code>{wallet_short}</code>\nالمجموعة: <b>{collection_name}</b>\nالكمية: {quantity}"
+    if opensea_url:
+        msg += f"\n\n🔗 <a href='{opensea_url}'>OpenSea</a>"
     return msg
 
 # ---------------------------------------------------------------------------
-# شراء
+# ✅ شراء سريع
 # ---------------------------------------------------------------------------
 
-async def purchase_for_wallet(
-    wallet_config: WalletConfig,
-    w3: Web3,
+async def buy_immediately(
     slug: str,
+    chain_key: str,
     contract_address: str,
     price_wei: int,
-    max_per_wallet: Optional[int],
-    remaining: int,
-    eth_price_usd: float,
-    max_gas_fee_usd: float,
-) -> dict:
-    wallet_addr = wallet_config.wallet.lower()
-    lock = lock_manager.get_lock(wallet_addr)
-    
-    async with lock:
-        try:
-            if wallet_addr in successful_mints.get(slug, set()):
-                return {"success": False, "wallet": wallet_config.wallet, "reason": "already_bought"}
-            
-            result = await purchase_with_retry(
-                w3=w3,
-                private_key=wallet_config.private_key,
-                wallet_address=wallet_config.wallet,
-                nft_contract=contract_address,
-                price_wei_per_token=price_wei,
-                max_per_wallet=max_per_wallet,
-                remaining_supply=remaining,
-                eth_price_usd=eth_price_usd,
-                max_gas_fee_usd=max_gas_fee_usd,
-                max_retries=3,
-            )
-            
-            if result.get("success"):
-                if slug not in successful_mints:
-                    successful_mints[slug] = set()
-                successful_mints[slug].add(wallet_addr)
-                
-                message = build_success_message(wallet_config, result, wallet_config.current_detail)
-                telegram_manager.enqueue(wallet_config.bot_token, wallet_config.chat_id, message)
-            
-            return result
-        finally:
-            lock_manager.release_lock(wallet_addr)
-
-async def buy_immediately(slug: str, chain_key: str, detail: dict):
-    """شراء فوري بدون فحص (تم الفحص مسبقاً)"""
-    
-    stage = detail.get("active_stage")
-    if not stage:
-        return
-    
-    max_supply = int(detail.get("max_supply") or 0)
-    total_supply = int(detail.get("total_supply") or 0)
-    remaining = max_supply - total_supply
-    
-    if remaining <= 0:
-        return
-    
-    contract_address = detail.get("contract_address")
-    if not contract_address:
-        return
+    collection_name: str,
+    opensea_url: str,
+):
+    """شراء فوري لجميع المحافظ"""
     
     w3 = w3_instances[chain_key]
     eth_price_usd = get_eth_price_usd()
-    
-    onchain_price = await asyncio.to_thread(get_onchain_public_price_wei, w3, contract_address)
-    price_wei = onchain_price if onchain_price is not None else int(stage.get("price", "0"))
-    
-    max_per_wallet_raw = stage.get("max_total_mintable_by_wallet") or stage.get("max_per_wallet")
-    max_per_wallet = int(max_per_wallet_raw) if max_per_wallet_raw is not None else None
-    
     max_gas_fee_usd = config.chains[chain_key].max_gas_fee_usd
     
     already_bought = successful_mints.get(slug, set())
@@ -398,251 +276,301 @@ async def buy_immediately(slug: str, chain_key: str, detail: dict):
     if not pending_wallets:
         return
     
+    tasks = []
     for wallet in pending_wallets:
         wallet.chain_key = chain_key
-        wallet.current_detail = detail
+        
+        # قفل لمنع التضارب
+        lock = lock_manager.get_lock(wallet.wallet)
+        
+        async def buy_one(w=wallet, l=lock):
+            async with l:
+                try:
+                    if w.wallet.lower() in successful_mints.get(slug, set()):
+                        return
+                    
+                    result = await purchase_with_retry(
+                        w3=w3,
+                        private_key=w.private_key,
+                        wallet_address=w.wallet,
+                        nft_contract=contract_address,
+                        price_wei_per_token=price_wei,
+                        max_per_wallet=None,
+                        remaining_supply=1000,
+                        eth_price_usd=eth_price_usd,
+                        max_gas_fee_usd=max_gas_fee_usd,
+                        max_retries=2,
+                        retry_delay_base=0.5,
+                    )
+                    
+                    if result.get("success"):
+                        if slug not in successful_mints:
+                            successful_mints[slug] = set()
+                        successful_mints[slug].add(w.wallet.lower())
+                        
+                        wallet_short = f"{w.wallet[:6]}...{w.wallet[-4:]}"
+                        message = build_success_message(
+                            wallet_short,
+                            collection_name,
+                            opensea_url,
+                            "Robinhood" if chain_key == "robinhood" else "Ethereum",
+                            result.get("quantity", 0),
+                        )
+                        telegram_manager.enqueue(w.bot_token, w.chat_id, message)
+                except Exception as e:
+                    log.error(f"خطأ شراء {w.wallet[:8]}: {e}")
+                finally:
+                    lock_manager.release_lock(w.wallet)
+        
+        tasks.append(buy_one())
     
-    tasks = [
-        purchase_for_wallet(
-            wallet_config=wallet,
-            w3=w3,
-            slug=slug,
-            contract_address=contract_address,
-            price_wei=price_wei,
-            max_per_wallet=max_per_wallet,
-            remaining=remaining,
-            eth_price_usd=eth_price_usd,
-            max_gas_fee_usd=max_gas_fee_usd,
-        )
-        for wallet in pending_wallets
-    ]
-    
+    # تنفيذ متوازي
     await asyncio.gather(*tasks, return_exceptions=True)
 
 # ---------------------------------------------------------------------------
-# فحص تويتر
+# ✅ فحص تويتر سريع مع cache
 # ---------------------------------------------------------------------------
 
-async def check_twitter(slug: str) -> Tuple[bool, Optional[str]]:
-    twitter_username = await asyncio.to_thread(
-        get_twitter_username_from_opensea,
-        slug,
-        config.opensea_api_key
-    )
-    return bool(twitter_username), twitter_username
+_twitter_cache: Dict[str, Tuple[float, Optional[str]]] = {}
+_twitter_cache_ttl = 3600  # ساعة cache
+
+async def check_twitter_fast(slug: str) -> Tuple[bool, Optional[str]]:
+    """فحص تويتر مع cache"""
+    
+    # استخدام cache
+    if slug in _twitter_cache:
+        ts, username = _twitter_cache[slug]
+        if time.time() - ts < _twitter_cache_ttl:
+            return bool(username), username
+    
+    # فحص جديد
+    try:
+        username = await asyncio.wait_for(
+            asyncio.to_thread(get_twitter_username_from_opensea, slug, config.opensea_api_key),
+            timeout=8,
+        )
+        _twitter_cache[slug] = (time.time(), username)
+        return bool(username), username
+    except:
+        return False, None
 
 # ---------------------------------------------------------------------------
-# تقييم المينتات الجديدة
+# ✅ معالجة سريعة للحدث من WebSocket
 # ---------------------------------------------------------------------------
 
-async def evaluate_new_mint(slug: str, chain_key: str):
-    if slug in known_slugs or slug in watchlist or slug in in_flight:
+async def process_new_mint_fast(slug: str, chain_key: str, payload: dict):
+    """معالجة سريعة للمينت الجديد"""
+    
+    if slug in processed_slugs or slug in in_flight:
         return
     
     in_flight.add(slug)
-    known_slugs.add(slug)
+    processed_slugs.add(slug)
     
     try:
-        found, detail = await asyncio.to_thread(opensea_api.fetch_drop_detail, slug)
+        # ✅ 1. استخراج البيانات من WebSocket مباشرة (0 ثانية)
+        collection = payload.get("collection", {}) or {}
+        item = payload.get("item", {}) or {}
         
-        if not found or not detail or not detail.get("is_minting"):
-            return
+        contract_address = (
+            collection.get("contract_address") or
+            (item.get("nft", {}) or {}).get("contract") or
+            ""
+        )
         
-        stage = detail.get("active_stage")
-        if not stage:
-            return
+        collection_name = collection.get("name") or collection.get("slug") or slug
+        opensea_url = collection.get("opensea_url") or f"https://opensea.io/collection/{slug}"
         
-        w3 = w3_instances[chain_key]
-        contract_address = detail.get("contract_address")
+        if not contract_address:
+            # Fallback للـ API
+            found, detail = await asyncio.to_thread(fetch_drop_detail_fast, slug)
+            if not found or not detail:
+                return
+            contract_address = detail.get("contract_address", "")
+            collection_name = detail.get("collection_name") or collection_name
+            opensea_url = detail.get("opensea_url") or opensea_url
         
         if not contract_address:
             return
         
-        mint_status, start_time, end_time = get_mint_status(w3, contract_address)
+        w3 = w3_instances[chain_key]
         
-        # ✅ المينت لم يبدأ - فحص مسبق
-        if mint_status == MintStatus.NOT_STARTED:
-            wait_seconds = start_time - int(time.time())
-            
-            if wait_seconds <= config.notify_before_start:
-                log.info(f"🔔 '{slug}' سيبدأ خلال {wait_seconds} ثانية - فحص مسبق")
-                
-                has_twitter, twitter_username = await check_twitter(slug)
-                
-                if not has_twitter:
-                    log.info(f"⏭️ '{slug}' لا يوجد X - تجاهل")
-                    return
-                
-                entry = WatchlistEntry(
-                    chain_key=chain_key,
-                    detail=detail,
-                    added_at=time.time(),
-                    twitter_checked=True,
-                    twitter_username=twitter_username,
-                    mint_status=MintStatus.NOT_STARTED,
-                    mint_start_time=start_time,
-                    mint_end_time=end_time,
-                )
-                watchlist[slug] = entry
-                
-                message = build_start_notification(detail, wait_seconds)
-                telegram_manager.broadcast(message, config.wallets)
-            else:
-                log.info(f"⏰ '{slug}' بعد أكثر من 12 ساعة - تجاهل")
-            
+        # ✅ 2. قراءة blockchain واحدة فقط (0.5 ثانية)
+        try:
+            public_drop = await asyncio.wait_for(
+                asyncio.to_thread(get_full_drop_info_fast, w3, contract_address),
+                timeout=5,
+            )
+        except:
             return
         
-        # المينت انتهى
-        if mint_status == MintStatus.ENDED:
+        if not public_drop:
             return
         
-        # ✅ المينت نشط
+        price_wei = public_drop[0]
+        start_time = public_drop[1]
+        end_time = public_drop[2]
+        
+        current_time = int(time.time())
         eth_price_usd = get_eth_price_usd()
-        onchain_price = await asyncio.to_thread(get_onchain_public_price_wei, w3, contract_address)
-        price_wei = onchain_price if onchain_price is not None else int(stage.get("price", "0"))
-        price_usd = calculate_price_usd(price_wei, eth_price_usd)
         
-        # ✅ مجاني - شراء فوري
-        if is_free_or_negligible(price_wei, eth_price_usd):
-            log.info(f"🆓 '{slug}' مجاني - شراء")
+        # ✅ 3. المينت لم يبدأ - فحص مسبق سريع
+        if start_time and current_time < start_time:
+            wait_seconds = start_time - current_time
             
-            has_twitter, twitter_username = await check_twitter(slug)
+            if wait_seconds > config.notify_before_start:
+                return
+            
+            log.info(f"🔔 '{slug}' سيبدأ خلال {wait_seconds} ثانية")
+            
+            # فحص تويتر مسبق
+            has_twitter, twitter_username = await check_twitter_fast(slug)
+            
             if not has_twitter:
                 log.info(f"⏭️ '{slug}' لا يوجد X")
                 return
             
-            await buy_immediately(slug, chain_key, detail)
+            # حفظ للمراقبة
+            pending_mints[slug] = PendingMint(
+                slug=slug,
+                chain_key=chain_key,
+                contract_address=contract_address,
+                start_time=start_time,
+                end_time=end_time,
+                twitter_username=twitter_username,
+                collection_name=collection_name,
+                opensea_url=opensea_url,
+                added_at=time.time(),
+            )
+            
+            # إشعار
+            message = build_start_notification(collection_name, opensea_url, wait_seconds)
+            telegram_manager.broadcast(message, config.wallets)
+            return
         
-        # ⚠️ مدفوع - راقب لاحتمال فتح مرحلة مجانية
-        else:
-            log.info(f"💰 '{slug}' مدفوع (${price_usd:.4f}) - مراقبة لمرحلة مجانية")
-            
-            # فحص تويتر مسبقاً
-            has_twitter, twitter_username = await check_twitter(slug)
-            
-            if has_twitter:
-                entry = WatchlistEntry(
-                    chain_key=chain_key,
-                    detail=detail,
-                    added_at=time.time(),
-                    twitter_checked=True,
-                    twitter_username=twitter_username,
-                    mint_status=MintStatus.ACTIVE,
-                    mint_start_time=start_time,
-                    mint_end_time=end_time,
-                    is_free=False,
-                )
-                watchlist[slug] = entry
+        # ✅ 4. المينت انتهى
+        if end_time and current_time > end_time:
+            return
+        
+        # ✅ 5. المينت نشط - فحص السعر فقط
+        if not is_free_or_negligible(price_wei, eth_price_usd):
+            return
+        
+        log.info(f"🆓 '{slug}' مجاني - شراء")
+        
+        # فحص تويتر
+        has_twitter, twitter_username = await check_twitter_fast(slug)
+        
+        if not has_twitter:
+            log.info(f"⏭️ '{slug}' لا يوجد X")
+            return
+        
+        # ✅ شراء فوري
+        await buy_immediately(
+            slug=slug,
+            chain_key=chain_key,
+            contract_address=contract_address,
+            price_wei=price_wei,
+            collection_name=collection_name,
+            opensea_url=opensea_url,
+        )
     
     except Exception as e:
         log.error(f"خطأ '{slug}': {e}")
     finally:
         in_flight.discard(slug)
 
+def fetch_drop_detail_fast(slug: str) -> Tuple[bool, Optional[Dict]]:
+    """Fallback سريع للـ API"""
+    try:
+        resp = requests.get(
+            f"https://api.opensea.io/api/v2/drops/{slug}",
+            headers={"x-api-key": config.opensea_api_key},
+            timeout=5,
+        )
+        if resp.status_code == 200:
+            return True, resp.json()
+        return False, None
+    except:
+        return False, None
+
+def get_full_drop_info_fast(w3: Web3, contract_address: str):
+    """قراءة واحدة تجلب كل المعلومات"""
+    try:
+        from buyer import SEADROP_ADDRESS, SEADROP_ABI
+        seadrop = w3.eth.contract(address=SEADROP_ADDRESS, abi=SEADROP_ABI)
+        public_drop = seadrop.functions.getPublicDrop(
+            Web3.to_checksum_address(contract_address)
+        ).call()
+        return public_drop
+    except:
+        return None
+
 # ---------------------------------------------------------------------------
-# ✅ حلقة المراقبة - نوعان من المراقبة
+# ✅ حلقة المراقبة - نوم ذكي فقط
 # ---------------------------------------------------------------------------
 
 async def watch_loop():
-    """تراقب المينتات القادمة (نوم ذكي) والمينتات المدفوعة (فحص سعر دوري)"""
+    """تنام حتى وقت البدء ثم تشتري فوراً"""
     
     while True:
-        now = time.time()
-        
-        # ✅ 1. المينتات التي لم تبدأ - نوم ذكي
-        upcoming = [
-            (entry.mint_start_time, slug, entry)
-            for slug, entry in watchlist.items()
-            if entry.mint_status == MintStatus.NOT_STARTED and entry.mint_start_time
-        ]
-        
-        if upcoming:
-            upcoming.sort(key=lambda x: x[0])
-            next_start_time, next_slug, next_entry = upcoming[0]
-            
-            sleep_seconds = next_start_time - now - 1
-            
-            if sleep_seconds > 0:
-                log.info(f"😴 '{next_slug}' يبدأ بعد {sleep_seconds} ثانية")
-                await asyncio.sleep(sleep_seconds)
-            
-            # استيقظنا - شراء فوري
-            log.info(f"🎉 '{next_slug}' بدأ! - شراء فوري")
-            
-            try:
-                await buy_immediately(next_slug, next_entry.chain_key, next_entry.detail)
-            except Exception as e:
-                log.error(f"خطأ شراء '{next_slug}': {e}")
-            finally:
-                watchlist.pop(next_slug, None)
+        if not pending_mints:
+            await asyncio.sleep(5)
             continue
         
-        # ✅ 2. المينتات المدفوعة - فحص سعر دوري
-        paid_mints = [
-            (slug, entry)
-            for slug, entry in watchlist.items()
-            if entry.mint_status == MintStatus.ACTIVE and not entry.is_free
-        ]
+        now = time.time()
         
-        if paid_mints:
-            for slug, entry in paid_mints:
-                # فحص السعر كل 60 ثانية
-                if now - entry.last_price_check < config.price_check_interval:
-                    continue
+        # ✅ ترتيب المينتات حسب وقت البدء
+        upcoming = sorted(
+            pending_mints.items(),
+            key=lambda x: x[1].start_time
+        )
+        
+        next_slug, next_mint = upcoming[0]
+        
+        # ✅ النوم حتى قبل البدء بثانية واحدة
+        sleep_seconds = next_mint.start_time - now - 1
+        
+        if sleep_seconds > 0:
+            log.info(f"😴 '{next_slug}' بعد {sleep_seconds} ثانية")
+            await asyncio.sleep(sleep_seconds)
+        
+        # ✅ انتظار اللحظة بالضبط
+        now = time.time()
+        if now < next_mint.start_time:
+            await asyncio.sleep(next_mint.start_time - now)
+        
+        # ✅ المينت بدأ - شراء فوري
+        log.info(f"🎉 '{next_slug}' بدأ! - شراء فوري")
+        
+        try:
+            # جلب السعر الحالي
+            w3 = w3_instances[next_mint.chain_key]
+            public_drop = await asyncio.wait_for(
+                asyncio.to_thread(get_full_drop_info_fast, w3, next_mint.contract_address),
+                timeout=3,
+            )
+            
+            if public_drop:
+                price_wei = public_drop[0]
+                eth_price_usd = get_eth_price_usd()
                 
-                entry.last_price_check = now
-                entry.price_check_count += 1
-                
-                try:
-                    w3 = w3_instances[entry.chain_key]
-                    contract_address = entry.detail.get("contract_address")
-                    
-                    if not contract_address:
-                        watchlist.pop(slug, None)
-                        continue
-                    
-                    # فحص حالة المينت
-                    mint_status, _, _ = get_mint_status(w3, contract_address)
-                    
-                    if mint_status == MintStatus.ENDED:
-                        watchlist.pop(slug, None)
-                        continue
-                    
-                    # فحص السعر
-                    eth_price_usd = get_eth_price_usd()
-                    onchain_price = await asyncio.to_thread(
-                        get_onchain_public_price_wei,
-                        w3,
-                        contract_address
+                if is_free_or_negligible(price_wei, eth_price_usd):
+                    await buy_immediately(
+                        slug=next_slug,
+                        chain_key=next_mint.chain_key,
+                        contract_address=next_mint.contract_address,
+                        price_wei=price_wei,
+                        collection_name=next_mint.collection_name,
+                        opensea_url=next_mint.opensea_url,
                     )
-                    
-                    if onchain_price is None:
-                        continue
-                    
-                    price_wei = onchain_price
-                    
-                    # ✅ السعر أصبح مجاني!
-                    if is_free_or_negligible(price_wei, eth_price_usd):
-                        log.info(f"🎉 '{slug}' فتحت مرحلة مجانية! - شراء")
-                        
-                        # إشعار
-                        message = build_free_stage_notification(entry.detail)
-                        telegram_manager.broadcast(message, config.wallets)
-                        
-                        # شراء
-                        await buy_immediately(slug, entry.chain_key, entry.detail)
-                        
-                        # إزالة من المراقبة
-                        watchlist.pop(slug, None)
-                    
-                except Exception as e:
-                    log.error(f"خطأ فحص '{slug}': {e}")
-        
-        # ✅ 3. لا يوجد شيء - نم قليلاً
-        await asyncio.sleep(10)
+        except Exception as e:
+            log.error(f"خطأ شراء '{next_slug}': {e}")
+        finally:
+            pending_mints.pop(next_slug, None)
 
 # ---------------------------------------------------------------------------
-# OpenSea Stream
+# ✅ OpenSea Stream
 # ---------------------------------------------------------------------------
 
 class OpenSeaStream:
@@ -655,8 +583,8 @@ class OpenSeaStream:
     async def listen(self):
         while True:
             try:
-                async with websockets.connect(self.url, ping_interval=None, open_timeout=15) as ws:
-                    log.info(f"متصل بـ OpenSea Stream")
+                async with websockets.connect(self.url, ping_interval=None, open_timeout=10) as ws:
+                    log.info("متصل بـ OpenSea Stream")
                     
                     self.backoff = 1
                     
@@ -678,16 +606,18 @@ class OpenSeaStream:
                         except asyncio.TimeoutError:
                             continue
                         
-                        await self._process_message(raw)
+                        # ✅ معالجة فورية بدون انتظار
+                        asyncio.create_task(self._process_message_fast(raw))
             
             except (websockets.ConnectionClosed, OSError, asyncio.TimeoutError):
                 await asyncio.sleep(self.backoff)
                 self.backoff = min(self.backoff * 2, self.max_backoff)
             except Exception as e:
                 log.error(f"خطأ: {e}")
-                await asyncio.sleep(5)
+                await asyncio.sleep(3)
     
-    async def _process_message(self, raw: str):
+    async def _process_message_fast(self, raw: str):
+        """معالجة سريعة جداً"""
         try:
             parsed = json.loads(raw)
         except:
@@ -717,18 +647,8 @@ class OpenSeaStream:
         if not slug:
             return
         
-        if slug in known_slugs:
-            known_slugs.discard(slug)
-        
-        asyncio.create_task(evaluate_new_mint(slug, chain_key))
-
-# ---------------------------------------------------------------------------
-# مساعدة
-# ---------------------------------------------------------------------------
-
-def is_free_or_negligible(price_wei: int, eth_price_usd: float) -> bool:
-    price_usd = calculate_price_usd(price_wei, eth_price_usd)
-    return price_usd < config.free_price_threshold
+        # ✅ معالجة فورية
+        asyncio.create_task(process_new_mint_fast(slug, chain_key, payload))
 
 # ---------------------------------------------------------------------------
 # تشغيل
@@ -768,7 +688,7 @@ def main():
             break
         except Exception as e:
             log.critical(f"توقف: {e}")
-            time.sleep(5)
+            time.sleep(3)
 
 if __name__ == "__main__":
     main()
