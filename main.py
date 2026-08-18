@@ -2,7 +2,7 @@
 النظام الكامل — 10 محافظ، لكل محفظة بوت تيليجرام خاص بها:
   - يكتشف مينتات اليوم على Robinhood + Ethereum
   - يشتري لجميع المحافظ المعرفة بالتوازي (Parallel Execution)
-  - يرسل إشعارات فقط للمينتات القادمة وعند نجاح الشراء
+  - يرسل إشعارات فقط للمينتات القادمة (قبل 12 ساعة) وعند نجاح الشراء
   - يتعامل مع المينتات التي لم تبدأ بعد أو انتهت
   - يعرض روابط المينت في رسائل التيليجرام
 """
@@ -78,7 +78,7 @@ class WatchlistEntry:
     added_at: float
     last_check: float = 0
     check_count: int = 0
-    max_checks: int = 500
+    max_checks: int = 3000  # ✅ زيادة للمراقبة الطويلة (12 ساعة)
     twitter_checked: bool = False
     twitter_username: Optional[str] = None
     was_paid: bool = False
@@ -119,7 +119,7 @@ class Config:
         # تحميل المحافظ
         self.wallets = self._load_wallets()
         
-        # إعدادات المراقبة - استخدام القيم الافتراضية فقط
+        # إعدادات المراقبة
         self.heartbeat_interval = int(self._get_env("HEARTBEAT_INTERVAL", "20"))
         self.recv_timeout = int(self._get_env("RECV_TIMEOUT", "5"))
         self.watch_poll_interval = int(self._get_env("WATCH_POLL_INTERVAL", "15"))
@@ -132,8 +132,8 @@ class Config:
         self.urgent_price_threshold = 0.05
         self.normal_check_interval = 30
         self.low_check_interval = 60
-        self.max_wait_time = 3600  # ساعة كحد أقصى
-        self.notify_before_start = 300  # إشعار قبل 5 دقائق
+        self.max_wait_time = 43200  # ✅ 12 ساعة كحد أقصى للانتظار
+        self.notify_before_start = 43200  # ✅ إشعار قبل 12 ساعة
         
     def _get_env(self, key: str, default: str = "", required: bool = False) -> str:
         value = os.environ.get(key, default).strip()
@@ -458,11 +458,20 @@ def build_start_notification(detail: dict, wait_seconds: int) -> str:
     name = detail.get("collection_name") or detail.get("collection_slug", "Unknown")
     opensea_url = get_opensea_url(detail)
     
-    wait_minutes = wait_seconds // 60
+    # ✅ تحويل الثواني إلى ساعات ودقائق
+    wait_hours = wait_seconds // 3600
+    wait_minutes = (wait_seconds % 3600) // 60
     wait_secs = wait_seconds % 60
     
-    if wait_minutes > 0:
-        time_str = f"{wait_minutes} دقيقة و {wait_secs} ثانية"
+    # بناء نص الوقت
+    if wait_hours > 0:
+        time_str = f"{wait_hours} ساعة"
+        if wait_minutes > 0:
+            time_str += f" و {wait_minutes} دقيقة"
+    elif wait_minutes > 0:
+        time_str = f"{wait_minutes} دقيقة"
+        if wait_secs > 0:
+            time_str += f" و {wait_secs} ثانية"
     else:
         time_str = f"{wait_secs} ثانية"
     
@@ -725,10 +734,11 @@ async def evaluate_new_mint(slug: str, chain_key: str):
         if contract_address:
             mint_status, start_time, end_time = get_mint_status(w3, contract_address)
             
-            # المينت لم يبدأ بعد
+            # ✅ المينت لم يبدأ بعد
             if mint_status == MintStatus.NOT_STARTED:
                 wait_seconds = start_time - int(time.time())
                 
+                # ✅ إذا كان سيبدأ خلال 12 ساعة
                 if wait_seconds < config.max_wait_time:
                     log.info(f"⏰ '{slug}' سيبدأ خلال {wait_seconds} ثانية - إضافة للمراقبة")
                     
@@ -746,12 +756,13 @@ async def evaluate_new_mint(slug: str, chain_key: str):
                     )
                     watchlist[slug] = entry
                     
-                    # إرسال إشعار البدء فقط إذا كان سيبدأ خلال 5 دقائق
+                    # ✅ إرسال إشعار البدء إذا كان سيبدأ خلال 12 ساعة
                     if wait_seconds <= config.notify_before_start:
                         message = build_start_notification(detail, wait_seconds)
                         telegram_manager.broadcast(message, config.wallets)
+                        entry.start_notified = True
                 else:
-                    log.info(f"⏰ '{slug}' سيبدأ بعد وقت طويل ({wait_seconds} ثانية) - تجاهل")
+                    log.info(f"⏰ '{slug}' سيبدأ بعد أكثر من 12 ساعة - تجاهل")
                 
                 return
             
@@ -785,7 +796,6 @@ async def evaluate_new_mint(slug: str, chain_key: str):
             results = await try_buy_now_multi_wallet(slug, chain_key, detail)
             
             if results is None:
-                # مدفوع - أضف للمراقبة بدون إشعار
                 await add_to_watchlist_silent(slug, chain_key, detail)
                 return
             
@@ -942,7 +952,7 @@ async def check_watchlist_entry(slug: str, entry: WatchlistEntry):
         
         mint_status, start_time, end_time = get_mint_status(w3, contract_address)
         
-        # المينت لم يبدأ بعد
+        # ✅ المينت لم يبدأ بعد
         if mint_status == MintStatus.NOT_STARTED:
             entry.mint_status = MintStatus.NOT_STARTED
             entry.mint_start_time = start_time
@@ -953,7 +963,7 @@ async def check_watchlist_entry(slug: str, entry: WatchlistEntry):
             
             wait_seconds = start_time - int(time.time()) if start_time else 0
             
-            # إرسال إشعار البدء فقط إذا لم يتم إرساله من قبل وسيبدأ خلال 5 دقائق
+            # ✅ إرسال إشعار البدء إذا لم يتم إرساله من قبل وسيبدأ خلال 12 ساعة
             if not entry.start_notified and wait_seconds <= config.notify_before_start:
                 message = build_start_notification(fresh_detail, wait_seconds)
                 telegram_manager.broadcast(message, config.wallets)
@@ -1194,7 +1204,6 @@ async def run():
         await telegram_manager.send_queue.join()
         return
     
-    # إشعار التشغيل فقط
     telegram_manager.broadcast(
         "✅ تم تشغيل النظام بنجاح!",
         config.wallets
