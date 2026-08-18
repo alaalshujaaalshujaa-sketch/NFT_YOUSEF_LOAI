@@ -4,6 +4,7 @@
   - يشتري لجميع المحافظ المعرفة بالتوازي (Parallel Execution)
   - يرسل إشعار الشراء أو التحديث لكل محفظة على بوت التيليجرام الخاص بها
   - يراقب المينتات المدفوعة التي قد تتحول لمرحلة مجانية
+  - مراقبة ذكية بأولويات متغيرة للحفاظ على السرعة
 """
 
 import asyncio
@@ -12,8 +13,9 @@ import logging
 import os
 import time
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Set
 from dataclasses import dataclass, field
+from enum import Enum
 
 import requests
 import websockets
@@ -34,6 +36,12 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # الإعدادات والتكوين
 # ---------------------------------------------------------------------------
+
+class WatchPriority(Enum):
+    """أولوية المراقبة"""
+    URGENT = "urgent"      # فحص كل 15 ثانية
+    NORMAL = "normal"      # فحص كل 30 ثانية
+    LOW = "low"            # فحص كل 60 ثانية
 
 @dataclass
 class ChainConfig:
@@ -62,11 +70,14 @@ class WatchlistEntry:
     added_at: float
     last_check: float = 0
     check_count: int = 0
-    max_checks: int = 100  # حد أقصى للمراقبة
-    twitter_checked: bool = False  # هل تم فحص تويتر مسبقاً
-    twitter_username: Optional[str] = None  # اسم مستخدم تويتر إذا تم فحصه
-    was_paid: bool = False  # هل كان المينت مدفوعاً
-    last_price_usd: float = 0.0  # آخر سعر تم رصده
+    max_checks: int = 200  # حد أقصى للمراقبة
+    twitter_checked: bool = False
+    twitter_username: Optional[str] = None
+    was_paid: bool = False
+    last_price_usd: float = 0.0
+    priority: WatchPriority = WatchPriority.NORMAL
+    last_notification_time: float = 0
+    notification_interval: int = 300  # 5 دقائق بين الإشعارات
 
 class Config:
     """إدارة الإعدادات من ملف .env"""
@@ -105,6 +116,11 @@ class Config:
         self.free_price_threshold = float(self._get_env("FREE_PRICE_THRESHOLD", "0.01"))
         self.max_watchlist_size = int(self._get_env("MAX_WATCHLIST_SIZE", "50"))
         self.min_balance_reserve_usd = float(self._get_env("MIN_BALANCE_RESERVE_USD", "0.10"))
+        
+        # عتبات الأولوية
+        self.urgent_price_threshold = float(self._get_env("URGENT_PRICE_THRESHOLD", "0.05"))
+        self.normal_check_interval = int(self._get_env("NORMAL_CHECK_INTERVAL", "30"))
+        self.low_check_interval = int(self._get_env("LOW_CHECK_INTERVAL", "60"))
         
     def _get_env(self, key: str, default: str = "", required: bool = False) -> str:
         """جلب قيمة من البيئة مع التحقق من وجودها"""
@@ -164,7 +180,8 @@ lock_manager = LockManager()
 # تتبع الحالة
 successful_mints: Dict[str, set] = {}
 watchlist: Dict[str, WatchlistEntry] = {}
-in_flight: set = set()
+in_flight: Set[str] = set()
+known_slugs: Set[str] = set()  # لتتبع كل الـ slugs المعروفة
 
 # Cache لسعر ETH
 _eth_price_cache = {"value": None, "ts": 0, "ttl": 300}
@@ -195,6 +212,15 @@ def get_eth_price_usd() -> float:
 def calculate_price_usd(price_wei: int, eth_price_usd: float) -> float:
     """حساب السعر بالدولار من wei"""
     return (price_wei / 1e18) * eth_price_usd
+
+def determine_priority(price_usd: float) -> WatchPriority:
+    """تحديد أولوية المراقبة بناءً على السعر"""
+    if price_usd < config.urgent_price_threshold:
+        return WatchPriority.URGENT
+    elif price_usd < 0.5:  # أقل من 50 سنت
+        return WatchPriority.NORMAL
+    else:
+        return WatchPriority.LOW
 
 # ---------------------------------------------------------------------------
 # إدارة التخزين المؤقت للرفض
@@ -246,13 +272,18 @@ class OpenSeaAPI:
     def __init__(self, api_key: str):
         self.api_key = api_key
         self.base_url = "https://api.opensea.io/api/v2"
+        self._cache: Dict[str, Tuple[float, Dict]] = {}
+        self._cache_ttl = 30  # 30 ثانية cache
     
-    def fetch_drop_detail(self, slug: str) -> Tuple[bool, Optional[Dict]]:
-        """جلب تفاصيل drop محدد
+    def fetch_drop_detail(self, slug: str, use_cache: bool = True) -> Tuple[bool, Optional[Dict]]:
+        """جلب تفاصيل drop محدد مع cache"""
         
-        Returns:
-            (found, detail) - found=True إذا وجد الـ drop
-        """
+        # استخدام cache إذا كان متاحاً وحديثاً
+        if use_cache and slug in self._cache:
+            timestamp, data = self._cache[slug]
+            if time.time() - timestamp < self._cache_ttl:
+                return True, data
+        
         try:
             resp = requests.get(
                 f"{self.base_url}/drops/{slug}",
@@ -261,7 +292,10 @@ class OpenSeaAPI:
             )
             
             if resp.status_code == 200:
-                return True, resp.json()
+                data = resp.json()
+                # تحديث cache
+                self._cache[slug] = (time.time(), data)
+                return True, data
             elif resp.status_code == 404:
                 return False, None
             elif resp.status_code == 429:
@@ -277,6 +311,13 @@ class OpenSeaAPI:
         except Exception as e:
             log.warning(f"[Drops API] خطأ: {e}")
             return None, None
+    
+    def cleanup_cache(self):
+        """تنظيف cache القديم"""
+        now = time.time()
+        expired = [s for s, (ts, _) in self._cache.items() if now - ts > self._cache_ttl * 2]
+        for s in expired:
+            self._cache.pop(s, None)
 
 opensea_api = OpenSeaAPI(config.opensea_api_key)
 
@@ -292,6 +333,7 @@ class TelegramManager:
         self.max_per_second = max_messages_per_second
         self.last_send: Dict[str, float] = {}
         self._sender_task: Optional[asyncio.Task] = None
+        self._recent_messages: Dict[str, float] = {}  # لمنع تكرار الرسائل
     
     async def start(self):
         """بدء معالج الإرسال"""
@@ -306,8 +348,17 @@ class TelegramManager:
             except asyncio.CancelledError:
                 pass
     
-    def enqueue(self, bot_token: str, chat_id: str, text: str):
-        """إضافة رسالة للطابور"""
+    def enqueue(self, bot_token: str, chat_id: str, text: str, deduplicate: bool = True):
+        """إضافة رسالة للطابور مع منع التكرار"""
+        
+        # منع تكرار نفس الرسالة خلال 5 ثواني
+        if deduplicate:
+            msg_key = f"{bot_token}:{chat_id}:{text[:100]}"
+            last_time = self._recent_messages.get(msg_key, 0)
+            if time.time() - last_time < 5:
+                return
+            self._recent_messages[msg_key] = time.time()
+        
         try:
             self.send_queue.put_nowait({
                 "bot_token": bot_token,
@@ -318,10 +369,10 @@ class TelegramManager:
         except asyncio.QueueFull:
             log.error("طابور التيليجرام ممتلئ!")
     
-    def broadcast(self, text: str, wallets: List[WalletConfig]):
+    def broadcast(self, text: str, wallets: List[WalletConfig], deduplicate: bool = True):
         """إرسال رسالة لجميع المحافظ"""
         for wallet in wallets:
-            self.enqueue(wallet.bot_token, wallet.chat_id, text)
+            self.enqueue(wallet.bot_token, wallet.chat_id, text, deduplicate)
     
     async def _sender_loop(self):
         """معالج إرسال الرسائل مع rate limiting"""
@@ -610,6 +661,10 @@ async def check_twitter(slug: str, entry: Optional[WatchlistEntry] = None) -> Tu
 async def evaluate_new_mint(slug: str, chain_key: str):
     """تقييم مينت جديد واتخاذ قرار الشراء أو المراقبة"""
     
+    # فحص سريع أولي
+    if slug in known_slugs:
+        return  # تمت معالجته مسبقاً
+    
     # التحقق من الحالة
     if (
         len(successful_mints.get(slug, set())) >= len(config.wallets)
@@ -620,12 +675,14 @@ async def evaluate_new_mint(slug: str, chain_key: str):
         return
     
     in_flight.add(slug)
+    known_slugs.add(slug)
     
     try:
-        # جلب تفاصيل المينت
+        # جلب تفاصيل المينت (بدون cache للتقييم الأولي)
         found, detail = await asyncio.to_thread(
             opensea_api.fetch_drop_detail,
-            slug
+            slug,
+            False
         )
         
         if not found or not detail or not detail.get("is_minting"):
@@ -653,7 +710,7 @@ async def evaluate_new_mint(slug: str, chain_key: str):
             price_wei = onchain_price if onchain_price is not None else int(stage.get("price", "0"))
             price_usd = calculate_price_usd(price_wei, eth_price_usd)
         
-        # ✅ المينت مجاني - فحص تويتر والشراء
+        # ✅ المينت مجاني - فحص تويتر والشراء فوراً
         if price_wei is None or is_free_or_negligible(price_wei, eth_price_usd):
             log.info(f"🆓 '{slug}' مجاني (${price_usd:.4f}) - فحص تويتر والشراء")
             
@@ -677,36 +734,30 @@ async def evaluate_new_mint(slug: str, chain_key: str):
             if len(successful_mints.get(slug, set())) < len(config.wallets):
                 await add_to_watchlist(slug, chain_key, detail, "لم تكتمل كل المحافظ")
         
-        # ⚠️ المينت مدفوع - قد يصبح مجاني لاحقاً
+        # ⚠️ المينت مدفوع - أضف للمراقبة بدون فحص تويتر (تأجيل للسرعة)
         else:
             log.info(f"💰 '{slug}' مدفوع (${price_usd:.4f}) - إضافة للمراقبة")
             
-            # فحص تويتر مسبقاً لتوفير الوقت لاحقاً
-            has_twitter, twitter_username = await check_twitter(slug)
+            # تحديد الأولوية
+            priority = determine_priority(price_usd)
             
-            if has_twitter:
-                # إضافة للمراقبة مع معلومات تويتر
-                entry = WatchlistEntry(
-                    chain_key=chain_key,
-                    detail=detail,
-                    added_at=time.time(),
-                    twitter_checked=True,
-                    twitter_username=twitter_username,
-                    was_paid=True,
-                    last_price_usd=price_usd,
-                )
-                watchlist[slug] = entry
-                
-                # إشعار المراقبة
-                message = build_watching_message(
-                    detail, 
-                    f"مدفوع حالياً (${price_usd:.4f}) - نراقب لاحتمال انخفاض السعر"
-                )
-                telegram_manager.broadcast(message, config.wallets)
-            else:
-                # لا يوجد تويتر - تجاهل نهائي
-                log.info(f"⏭️ تجاهل '{slug}': لا يوجد حساب X مربوط.")
-                rejection_manager.mark_rejected(slug)
+            # إضافة للمراقبة مباشرة بدون فحص تويتر
+            entry = WatchlistEntry(
+                chain_key=chain_key,
+                detail=detail,
+                added_at=time.time(),
+                was_paid=True,
+                last_price_usd=price_usd,
+                priority=priority,
+            )
+            watchlist[slug] = entry
+            
+            # إشعار واحد فقط
+            message = build_watching_message(
+                detail, 
+                f"مدفوع (${price_usd:.4f}) - أولوية {priority.value}"
+            )
+            telegram_manager.broadcast(message, config.wallets)
     
     except Exception as e:
         log.error(f"خطأ بتقييم '{slug}': {e}", exc_info=True)
@@ -721,6 +772,11 @@ async def add_to_watchlist(slug: str, chain_key: str, detail: dict, reason: str)
         log.warning(f"قائمة المراقبة ممتلئة ({config.max_watchlist_size}). تجاهل '{slug}'")
         return
     
+    # إذا كان موجوداً، فقط تحديث
+    if slug in watchlist:
+        watchlist[slug].detail = detail
+        return
+    
     entry = WatchlistEntry(
         chain_key=chain_key,
         detail=detail,
@@ -733,14 +789,20 @@ async def add_to_watchlist(slug: str, chain_key: str, detail: dict, reason: str)
     telegram_manager.broadcast(message, config.wallets)
 
 # ---------------------------------------------------------------------------
-# حلقة المراقبة
+# حلقة المراقبة الذكية
 # ---------------------------------------------------------------------------
 
 async def watch_loop():
-    """مراقبة المينتات في قائمة المراقبة والتحقق من تغير الأسعار"""
+    """مراقبة ذكية بأولويات متغيرة"""
+    
+    last_normal_check = 0
+    last_low_check = 0
+    last_cache_cleanup = 0
     
     while True:
         await asyncio.sleep(config.watch_poll_interval)
+        
+        now = time.time()
         
         if not watchlist:
             continue
@@ -748,133 +810,172 @@ async def watch_loop():
         # تنظيف دوري
         rejection_manager.cleanup()
         
-        for slug in list(watchlist.keys()):
-            entry = watchlist.get(slug)
-            if not entry:
-                continue
-            
-            # التحقق من شروط الإيقاف
-            if slug in in_flight:
-                continue
-            
-            if len(successful_mints.get(slug, set())) >= len(config.wallets):
-                watchlist.pop(slug, None)
-                continue
-            
-            # التحقق من عدد المحاولات
-            if entry.check_count >= entry.max_checks:
-                watchlist.pop(slug, None)
-                message = build_gave_up_message(entry.detail, "تجاوز الحد الأقصى للمحاولات")
-                telegram_manager.broadcast(message, config.wallets)
-                continue
-            
-            in_flight.add(slug)
-            entry.check_count += 1
-            entry.last_check = time.time()
-            
-            try:
-                # جلب التفاصيل المحدثة
-                found, fresh_detail = await asyncio.to_thread(
-                    opensea_api.fetch_drop_detail,
-                    slug
-                )
+        # تنظيف cache كل 5 دقائق
+        if now - last_cache_cleanup > 300:
+            opensea_api.cleanup_cache()
+            last_cache_cleanup = now
+        
+        # فصل المينتات حسب الأولوية
+        urgent_entries = {
+            slug: entry for slug, entry in watchlist.items()
+            if entry.priority == WatchPriority.URGENT
+        }
+        normal_entries = {
+            slug: entry for slug, entry in watchlist.items()
+            if entry.priority == WatchPriority.NORMAL
+        }
+        low_entries = {
+            slug: entry for slug, entry in watchlist.items()
+            if entry.priority == WatchPriority.LOW
+        }
+        
+        # فحص urgent كل دورة (15 ثانية)
+        for slug, entry in urgent_entries.items():
+            await check_watchlist_entry(slug, entry)
+        
+        # فحص normal كل 30 ثانية
+        if now - last_normal_check >= config.normal_check_interval:
+            for slug, entry in normal_entries.items():
+                await check_watchlist_entry(slug, entry)
+            last_normal_check = now
+        
+        # فحص low كل 60 ثانية
+        if now - last_low_check >= config.low_check_interval:
+            for slug, entry in low_entries.items():
+                await check_watchlist_entry(slug, entry)
+            last_low_check = now
+
+async def check_watchlist_entry(slug: str, entry: WatchlistEntry):
+    """فحص عنصر واحد في قائمة المراقبة"""
+    
+    # التحقق من شروط الإيقاف
+    if slug in in_flight:
+        return
+    
+    if len(successful_mints.get(slug, set())) >= len(config.wallets):
+        watchlist.pop(slug, None)
+        return
+    
+    # التحقق من عدد المحاولات
+    if entry.check_count >= entry.max_checks:
+        watchlist.pop(slug, None)
+        message = build_gave_up_message(entry.detail, "تجاوز الحد الأقصى للمحاولات")
+        telegram_manager.broadcast(message, config.wallets)
+        return
+    
+    in_flight.add(slug)
+    entry.check_count += 1
+    entry.last_check = time.time()
+    
+    try:
+        # جلب التفاصيل المحدثة (مع cache)
+        found, fresh_detail = await asyncio.to_thread(
+            opensea_api.fetch_drop_detail,
+            slug,
+            True
+        )
+        
+        if not found or not fresh_detail or not fresh_detail.get("is_minting"):
+            watchlist.pop(slug, None)
+            message = build_gave_up_message(entry.detail, "المينت لم يعد نشطًا")
+            telegram_manager.broadcast(message, config.wallets)
+            return
+        
+        # التحقق من المرحلة
+        stage = fresh_detail.get("active_stage")
+        if not stage or (stage_has_ended(stage) and not fresh_detail.get("next_stage")):
+            watchlist.pop(slug, None)
+            message = build_gave_up_message(fresh_detail, "انتهت المرحلة")
+            telegram_manager.broadcast(message, config.wallets)
+            return
+        
+        # فحص السعر الحالي
+        w3 = w3_instances[entry.chain_key]
+        eth_price_usd = get_eth_price_usd()
+        contract_address = fresh_detail.get("contract_address")
+        
+        if not contract_address:
+            return
+        
+        onchain_price = await asyncio.to_thread(
+            get_onchain_public_price_wei,
+            w3,
+            contract_address
+        )
+        
+        if onchain_price is None:
+            return
+        
+        price_wei = onchain_price
+        price_usd = calculate_price_usd(price_wei, eth_price_usd)
+        
+        # تحديث الأولوية
+        entry.priority = determine_priority(price_usd)
+        
+        # ✅ السعر أصبح مجاني/منخفض!
+        if is_free_or_negligible(price_wei, eth_price_usd):
+            # إذا كان المينت كان مدفوعاً وأصبح مجانياً
+            if entry.was_paid and entry.last_price_usd > 0:
+                log.info(f"🎉 '{slug}' انخفض سعره من ${entry.last_price_usd:.4f} إلى ${price_usd:.4f}!")
                 
-                if not found or not fresh_detail or not fresh_detail.get("is_minting"):
-                    watchlist.pop(slug, None)
-                    message = build_gave_up_message(entry.detail, "المينت لم يعد نشطًا")
-                    telegram_manager.broadcast(message, config.wallets)
-                    continue
-                
-                # التحقق من المرحلة
-                stage = fresh_detail.get("active_stage")
-                if not stage or (stage_has_ended(stage) and not fresh_detail.get("next_stage")):
-                    watchlist.pop(slug, None)
-                    message = build_gave_up_message(fresh_detail, "انتهت المرحلة")
-                    telegram_manager.broadcast(message, config.wallets)
-                    continue
-                
-                # فحص السعر الحالي
-                w3 = w3_instances[entry.chain_key]
-                eth_price_usd = get_eth_price_usd()
-                contract_address = fresh_detail.get("contract_address")
-                
-                if not contract_address:
-                    continue
-                
-                onchain_price = await asyncio.to_thread(
-                    get_onchain_public_price_wei,
-                    w3,
-                    contract_address
-                )
-                
-                if onchain_price is None:
-                    continue
-                
-                price_wei = onchain_price
-                price_usd = calculate_price_usd(price_wei, eth_price_usd)
-                
-                # ✅ السعر أصبح مجاني/منخفض!
-                if is_free_or_negligible(price_wei, eth_price_usd):
-                    # إذا كان المينت كان مدفوعاً وأصبح مجانياً
-                    if entry.was_paid and entry.last_price_usd > 0:
-                        log.info(f"🎉 '{slug}' انخفض سعره من ${entry.last_price_usd:.4f} إلى ${price_usd:.4f}!")
-                        
-                        # إشعار بانخفاض السعر
-                        message = build_price_drop_message(
-                            fresh_detail,
-                            entry.last_price_usd,
-                            price_usd
-                        )
-                        telegram_manager.broadcast(message, config.wallets)
-                    
-                    # التحقق من تويتر (باستخدام cache إذا كان متاحاً)
-                    has_twitter, twitter_username = await check_twitter(slug, entry)
-                    
-                    if not has_twitter:
-                        log.info(f"⏭️ '{slug}': لا يوجد حساب X مربوط.")
-                        watchlist.pop(slug, None)
-                        rejection_manager.mark_rejected(slug)
-                        continue
-                    
-                    log.info(f"✅ '{slug}': يوجد حساب X (@{twitter_username}) — جاري الشراء.")
-                    
-                    # محاولة الشراء
-                    results = await try_buy_now_multi_wallet(
-                        slug,
-                        entry.chain_key,
-                        fresh_detail
+                # إشعار بانخفاض السعر (مرة واحدة فقط)
+                if now - entry.last_notification_time > entry.notification_interval:
+                    message = build_price_drop_message(
+                        fresh_detail,
+                        entry.last_price_usd,
+                        price_usd
                     )
-                    
-                    if results is None:
-                        # لم يكتمل الشراء - تحديث البيانات
-                        entry.detail = fresh_detail
-                        entry.was_paid = False
-                        entry.last_price_usd = price_usd
-                    elif len(successful_mints.get(slug, set())) >= len(config.wallets):
-                        # اكتمل الشراء لجميع المحافظ
-                        watchlist.pop(slug, None)
-                        log.info(f"🎉 اكتمل الشراء لجميع المحافظ في '{slug}'")
-                    else:
-                        # تحديث البيانات
-                        entry.detail = fresh_detail
-                        entry.was_paid = False
-                        entry.last_price_usd = price_usd
-                
-                # ⚠️ المينت لا يزال مدفوعاً
-                else:
-                    # تحديث البيانات
-                    entry.detail = fresh_detail
-                    entry.was_paid = True
-                    entry.last_price_usd = price_usd
-                    
-                    # تسجيل التغير في السعر
-                    if entry.check_count % 10 == 0:  # كل 10 فحوصات
-                        log.info(f"💰 '{slug}' لا يزال مدفوعاً (${price_usd:.4f}) - فحص #{entry.check_count}")
+                    telegram_manager.broadcast(message, config.wallets)
+                    entry.last_notification_time = now
             
-            except Exception as e:
-                log.error(f"خطأ بدورة مراقبة '{slug}': {e}", exc_info=True)
-            finally:
-                in_flight.discard(slug)
+            # فحص تويتر (باستخدام cache إذا كان متاحاً)
+            has_twitter, twitter_username = await check_twitter(slug, entry)
+            
+            if not has_twitter:
+                log.info(f"⏭️ '{slug}': لا يوجد حساب X مربوط.")
+                watchlist.pop(slug, None)
+                rejection_manager.mark_rejected(slug)
+                return
+            
+            log.info(f"✅ '{slug}': يوجد حساب X (@{twitter_username}) — جاري الشراء.")
+            
+            # محاولة الشراء
+            results = await try_buy_now_multi_wallet(
+                slug,
+                entry.chain_key,
+                fresh_detail
+            )
+            
+            if results is None:
+                # لم يكتمل الشراء - تحديث البيانات
+                entry.detail = fresh_detail
+                entry.was_paid = False
+                entry.last_price_usd = price_usd
+            elif len(successful_mints.get(slug, set())) >= len(config.wallets):
+                # اكتمل الشراء لجميع المحافظ
+                watchlist.pop(slug, None)
+                log.info(f"🎉 اكتمل الشراء لجميع المحافظ في '{slug}'")
+            else:
+                # تحديث البيانات
+                entry.detail = fresh_detail
+                entry.was_paid = False
+                entry.last_price_usd = price_usd
+        
+        # ⚠️ المينت لا يزال مدفوعاً
+        else:
+            # تحديث البيانات
+            entry.detail = fresh_detail
+            entry.was_paid = True
+            entry.last_price_usd = price_usd
+            
+            # تسجيل التغير في السعر (فقط كل 10 فحوصات)
+            if entry.check_count % 10 == 0:
+                log.info(f"💰 '{slug}' لا يزال مدفوعاً (${price_usd:.4f}) - أولوية {entry.priority.value}")
+    
+    except Exception as e:
+        log.error(f"خطأ بدورة مراقبة '{slug}': {e}", exc_info=True)
+    finally:
+        in_flight.discard(slug)
 
 # ---------------------------------------------------------------------------
 # الاستماع لـ OpenSea Stream
@@ -1000,7 +1101,7 @@ class OpenSeaStream:
         if slug in watchlist:
             rejection_manager.unmark_rejected(slug)
         
-        # إنشاء مهمة للتقييم
+        # إنشاء مهمة للتقييم (بدون انتظار)
         asyncio.create_task(evaluate_new_mint(slug, chain_key))
 
 # ---------------------------------------------------------------------------
