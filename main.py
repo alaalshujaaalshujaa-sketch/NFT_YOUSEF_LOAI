@@ -1,5 +1,5 @@
 """
-النظام الكامل — فحص مسبق + نوم ذكي + شراء فوري
+النظام الكامل — فحص مسبق + نوم ذكي + شراء فوري + مراقبة المراحل المجانية
 """
 
 import asyncio
@@ -66,9 +66,10 @@ class WatchlistEntry:
     mint_status: MintStatus = MintStatus.UNKNOWN
     mint_start_time: Optional[int] = None
     mint_end_time: Optional[int] = None
-    price_checked: bool = False  # ✅ هل تم فحص السعر
-    is_free: bool = False  # ✅ هل السعر مجاني
+    is_free: bool = False
     start_notified: bool = False
+    last_price_check: float = 0
+    price_check_count: int = 0
 
 class Config:
     def __init__(self):
@@ -98,6 +99,7 @@ class Config:
         self.free_price_threshold = float(self._get_env("FREE_PRICE_THRESHOLD", "0.01"))
         
         self.notify_before_start = 43200  # 12 ساعة
+        self.price_check_interval = 60  # ✅ فحص السعر كل 60 ثانية للمينتات المدفوعة
         
     def _get_env(self, key: str, default: str = "", required: bool = False) -> str:
         value = os.environ.get(key, default).strip()
@@ -292,6 +294,16 @@ def build_start_notification(detail: dict, wait_seconds: int) -> str:
         msg += f"\n\n🔗 <a href='{url}'>OpenSea</a>"
     return msg
 
+def build_free_stage_notification(detail: dict) -> str:
+    """✅ إشعار فتح مرحلة مجانية"""
+    name = detail.get("collection_name") or detail.get("collection_slug", "Unknown")
+    url = get_opensea_url(detail)
+    
+    msg = f"🎉 <b>فتحت مرحلة مجانية!</b>\n\nالمجموعة: <b>{name}</b>\nجاري الشراء..."
+    if url:
+        msg += f"\n\n🔗 <a href='{url}'>OpenSea</a>"
+    return msg
+
 def build_success_message(wallet_config: WalletConfig, result: dict, detail: dict) -> str:
     name = detail.get("collection_name") or detail.get("collection_slug", "Unknown")
     url = get_opensea_url(detail)
@@ -352,7 +364,7 @@ async def purchase_for_wallet(
             lock_manager.release_lock(wallet_addr)
 
 async def buy_immediately(slug: str, chain_key: str, detail: dict):
-    """✅ شراء فوري بدون فحص (تم الفحص مسبقاً)"""
+    """شراء فوري بدون فحص (تم الفحص مسبقاً)"""
     
     stage = detail.get("active_stage")
     if not stage:
@@ -372,7 +384,6 @@ async def buy_immediately(slug: str, chain_key: str, detail: dict):
     w3 = w3_instances[chain_key]
     eth_price_usd = get_eth_price_usd()
     
-    # جلب السعر الحالي
     onchain_price = await asyncio.to_thread(get_onchain_public_price_wei, w3, contract_address)
     price_wei = onchain_price if onchain_price is not None else int(stage.get("price", "0"))
     
@@ -421,7 +432,7 @@ async def check_twitter(slug: str) -> Tuple[bool, Optional[str]]:
     return bool(twitter_username), twitter_username
 
 # ---------------------------------------------------------------------------
-# تقييم المينتات الجديدة مع فحص مسبق
+# تقييم المينتات الجديدة
 # ---------------------------------------------------------------------------
 
 async def evaluate_new_mint(slug: str, chain_key: str):
@@ -449,23 +460,19 @@ async def evaluate_new_mint(slug: str, chain_key: str):
         
         mint_status, start_time, end_time = get_mint_status(w3, contract_address)
         
-        # ✅ المينت لم يبدأ - فحص مسبق + إضافة للمراقبة
+        # ✅ المينت لم يبدأ - فحص مسبق
         if mint_status == MintStatus.NOT_STARTED:
             wait_seconds = start_time - int(time.time())
             
             if wait_seconds <= config.notify_before_start:
                 log.info(f"🔔 '{slug}' سيبدأ خلال {wait_seconds} ثانية - فحص مسبق")
                 
-                # ✅ فحص تويتر الآن
                 has_twitter, twitter_username = await check_twitter(slug)
                 
                 if not has_twitter:
                     log.info(f"⏭️ '{slug}' لا يوجد X - تجاهل")
                     return
                 
-                log.info(f"✅ '{slug}' لديه X (@{twitter_username})")
-                
-                # ✅ إضافة للمراقبة مع نتائج الفحص
                 entry = WatchlistEntry(
                     chain_key=chain_key,
                     detail=detail,
@@ -478,7 +485,6 @@ async def evaluate_new_mint(slug: str, chain_key: str):
                 )
                 watchlist[slug] = entry
                 
-                # إشعار البدء
                 message = build_start_notification(detail, wait_seconds)
                 telegram_manager.broadcast(message, config.wallets)
             else:
@@ -490,20 +496,43 @@ async def evaluate_new_mint(slug: str, chain_key: str):
         if mint_status == MintStatus.ENDED:
             return
         
-        # ✅ المينت نشط - شراء مباشر (فحص سريع)
+        # ✅ المينت نشط
         eth_price_usd = get_eth_price_usd()
         onchain_price = await asyncio.to_thread(get_onchain_public_price_wei, w3, contract_address)
         price_wei = onchain_price if onchain_price is not None else int(stage.get("price", "0"))
+        price_usd = calculate_price_usd(price_wei, eth_price_usd)
         
-        if not is_free_or_negligible(price_wei, eth_price_usd):
-            return
+        # ✅ مجاني - شراء فوري
+        if is_free_or_negligible(price_wei, eth_price_usd):
+            log.info(f"🆓 '{slug}' مجاني - شراء")
+            
+            has_twitter, twitter_username = await check_twitter(slug)
+            if not has_twitter:
+                log.info(f"⏭️ '{slug}' لا يوجد X")
+                return
+            
+            await buy_immediately(slug, chain_key, detail)
         
-        has_twitter, _ = await check_twitter(slug)
-        if not has_twitter:
-            return
-        
-        log.info(f"✅ '{slug}' شراء")
-        await buy_immediately(slug, chain_key, detail)
+        # ⚠️ مدفوع - راقب لاحتمال فتح مرحلة مجانية
+        else:
+            log.info(f"💰 '{slug}' مدفوع (${price_usd:.4f}) - مراقبة لمرحلة مجانية")
+            
+            # فحص تويتر مسبقاً
+            has_twitter, twitter_username = await check_twitter(slug)
+            
+            if has_twitter:
+                entry = WatchlistEntry(
+                    chain_key=chain_key,
+                    detail=detail,
+                    added_at=time.time(),
+                    twitter_checked=True,
+                    twitter_username=twitter_username,
+                    mint_status=MintStatus.ACTIVE,
+                    mint_start_time=start_time,
+                    mint_end_time=end_time,
+                    is_free=False,
+                )
+                watchlist[slug] = entry
     
     except Exception as e:
         log.error(f"خطأ '{slug}': {e}")
@@ -511,54 +540,106 @@ async def evaluate_new_mint(slug: str, chain_key: str):
         in_flight.discard(slug)
 
 # ---------------------------------------------------------------------------
-# ✅ حلقة المراقبة - نوم ذكي + شراء فوري
+# ✅ حلقة المراقبة - نوعان من المراقبة
 # ---------------------------------------------------------------------------
 
 async def watch_loop():
-    """تنام حتى وقت البدء ثم تشتري فوراً بدون فحص"""
+    """تراقب المينتات القادمة (نوم ذكي) والمينتات المدفوعة (فحص سعر دوري)"""
     
     while True:
-        upcoming = []
+        now = time.time()
         
-        for slug, entry in list(watchlist.items()):
-            if entry.mint_status == MintStatus.NOT_STARTED and entry.mint_start_time:
-                upcoming.append((entry.mint_start_time, slug, entry))
+        # ✅ 1. المينتات التي لم تبدأ - نوم ذكي
+        upcoming = [
+            (entry.mint_start_time, slug, entry)
+            for slug, entry in watchlist.items()
+            if entry.mint_status == MintStatus.NOT_STARTED and entry.mint_start_time
+        ]
         
-        if not upcoming:
-            await asyncio.sleep(30)
+        if upcoming:
+            upcoming.sort(key=lambda x: x[0])
+            next_start_time, next_slug, next_entry = upcoming[0]
+            
+            sleep_seconds = next_start_time - now - 1
+            
+            if sleep_seconds > 0:
+                log.info(f"😴 '{next_slug}' يبدأ بعد {sleep_seconds} ثانية")
+                await asyncio.sleep(sleep_seconds)
+            
+            # استيقظنا - شراء فوري
+            log.info(f"🎉 '{next_slug}' بدأ! - شراء فوري")
+            
+            try:
+                await buy_immediately(next_slug, next_entry.chain_key, next_entry.detail)
+            except Exception as e:
+                log.error(f"خطأ شراء '{next_slug}': {e}")
+            finally:
+                watchlist.pop(next_slug, None)
             continue
         
-        upcoming.sort(key=lambda x: x[0])
+        # ✅ 2. المينتات المدفوعة - فحص سعر دوري
+        paid_mints = [
+            (slug, entry)
+            for slug, entry in watchlist.items()
+            if entry.mint_status == MintStatus.ACTIVE and not entry.is_free
+        ]
         
-        next_start_time, next_slug, next_entry = upcoming[0]
-        now = int(time.time())
+        if paid_mints:
+            for slug, entry in paid_mints:
+                # فحص السعر كل 60 ثانية
+                if now - entry.last_price_check < config.price_check_interval:
+                    continue
+                
+                entry.last_price_check = now
+                entry.price_check_count += 1
+                
+                try:
+                    w3 = w3_instances[entry.chain_key]
+                    contract_address = entry.detail.get("contract_address")
+                    
+                    if not contract_address:
+                        watchlist.pop(slug, None)
+                        continue
+                    
+                    # فحص حالة المينت
+                    mint_status, _, _ = get_mint_status(w3, contract_address)
+                    
+                    if mint_status == MintStatus.ENDED:
+                        watchlist.pop(slug, None)
+                        continue
+                    
+                    # فحص السعر
+                    eth_price_usd = get_eth_price_usd()
+                    onchain_price = await asyncio.to_thread(
+                        get_onchain_public_price_wei,
+                        w3,
+                        contract_address
+                    )
+                    
+                    if onchain_price is None:
+                        continue
+                    
+                    price_wei = onchain_price
+                    
+                    # ✅ السعر أصبح مجاني!
+                    if is_free_or_negligible(price_wei, eth_price_usd):
+                        log.info(f"🎉 '{slug}' فتحت مرحلة مجانية! - شراء")
+                        
+                        # إشعار
+                        message = build_free_stage_notification(entry.detail)
+                        telegram_manager.broadcast(message, config.wallets)
+                        
+                        # شراء
+                        await buy_immediately(slug, entry.chain_key, entry.detail)
+                        
+                        # إزالة من المراقبة
+                        watchlist.pop(slug, None)
+                    
+                except Exception as e:
+                    log.error(f"خطأ فحص '{slug}': {e}")
         
-        # ✅ النوم حتى قبل وقت البدء بثانية واحدة
-        sleep_seconds = next_start_time - now - 1  # استيقظ قبل البدء بثانية
-        
-        if sleep_seconds > 0:
-            log.info(f"😴 '{next_slug}' يبدأ بعد {sleep_seconds} ثانية - نوم...")
-            await asyncio.sleep(sleep_seconds)
-        
-        # ✅ استيقظنا قبل البدء بثانية - انتظر اللحظة بالضبط
-        now = int(time.time())
-        if now < next_start_time:
-            await asyncio.sleep(next_start_time - now)
-        
-        # ✅ المينت بدأ الآن - شراء فوري بدون فحص!
-        log.info(f"🎉 '{next_slug}' بدأ! - شراء فوري")
-        
-        try:
-            # شراء مباشر - تم الفحص مسبقاً
-            await buy_immediately(
-                next_slug,
-                next_entry.chain_key,
-                next_entry.detail
-            )
-        except Exception as e:
-            log.error(f"خطأ شراء '{next_slug}': {e}")
-        finally:
-            watchlist.pop(next_slug, None)
+        # ✅ 3. لا يوجد شيء - نم قليلاً
+        await asyncio.sleep(10)
 
 # ---------------------------------------------------------------------------
 # OpenSea Stream
