@@ -7,7 +7,7 @@
 - تخزين الحالة في SQLite
 - التحقق من حساب X أو الموقع الإلكتروني (أحدهما كافٍ)
 - إشعارات محسنة مع تفاصيل كاملة
-- حد السعر المجاني 0.01 دولار (كما في الكود الأصلي)
+- حد السعر المجاني 0.01 دولار
 """
 
 import asyncio
@@ -42,7 +42,7 @@ load_dotenv()
 
 OPENSEA_API_KEY = os.environ["OPENSEA_API_KEY"]
 BOT_ENABLED = os.environ.get("BOT_ENABLED", "false").lower() == "true"
-CHECK_WEBSITE = os.environ.get("CHECK_WEBSITE", "true").lower() == "true"  # تفعيل التحقق من الموقع
+CHECK_WEBSITE = os.environ.get("CHECK_WEBSITE", "true").lower() == "true"
 
 # المحافظ والمفاتيح
 PRIVATE_KEYS = [k.strip() for k in os.environ.get("PRIVATE_KEYS", "").split(",") if k.strip()]
@@ -92,6 +92,7 @@ STREAM_NAME_TO_CHAIN_KEY = {cfg["stream_chain_name"]: key for key, cfg in CHAIN_
 
 STREAM_URL = f"wss://stream.openseabeta.com/socket/websocket?token={OPENSEA_API_KEY}&vsn=2.0.0"
 DROPS_API_BASE = "https://api.opensea.io/api/v2/drops"
+COLLECTION_API_BASE = "https://api.opensea.io/api/v2/collections"
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 LOCAL_TZ = timezone(timedelta(hours=3))
 
@@ -233,57 +234,125 @@ def remove_rejected_cooldown(slug: str):
             conn.commit()
 
 
-# ======================== دوال التحقق من الموقع و X ========================
+# ======================== دوال محسنة لجلب X والموقع ========================
 
-def get_twitter_username_from_opensea(slug: str, api_key: str) -> Optional[str]:
-    """الحصول على اسم حساب X (تويتر) من OpenSea"""
+def get_collection_details(slug: str, api_key: str) -> Optional[Dict[str, Any]]:
+    """
+    جلب تفاصيل المجموعة من OpenSea
+    هذه الدالة تجلب جميع البيانات في طلب واحد
+    """
     try:
-        url = f"https://api.opensea.io/api/v2/collections/{slug}"
+        url = f"{COLLECTION_API_BASE}/{slug}"
         headers = {"x-api-key": api_key}
+        log.info(f"[API] جلب تفاصيل {slug} من {url}")
+        
         resp = requests.get(url, headers=headers, timeout=10)
         
         if resp.status_code == 200:
             data = resp.json()
             collection = data.get("collection", {})
+            log.info(f"[API] ✅ تم جلب تفاصيل {slug} بنجاح")
+            return collection
+        elif resp.status_code == 404:
+            log.warning(f"[API] ❌ المجموعة {slug} غير موجودة")
+            return None
+        else:
+            log.warning(f"[API] ⚠️ خطأ {resp.status_code} لجلب {slug}")
+            return None
             
-            twitter_username = collection.get("twitter_username")
-            if twitter_username:
-                return twitter_username
-            
-            external_url = collection.get("external_url", "")
-            if "twitter.com" in external_url or "x.com" in external_url:
-                parts = external_url.split("/")
-                if parts:
-                    return parts[-1]
-        
+    except requests.exceptions.Timeout:
+        log.warning(f"[API] ⏰ انتهى الوقت لجلب {slug}")
         return None
     except Exception as e:
-        log.warning(f"[X] خطأ لجلب حساب X لـ {slug}: {e}")
+        log.warning(f"[API] ❌ خطأ لجلب {slug}: {e}")
+        return None
+
+
+def get_twitter_username_from_opensea(slug: str, api_key: str) -> Optional[str]:
+    """
+    الحصول على اسم حساب X (تويتر) من OpenSea
+    """
+    try:
+        collection = get_collection_details(slug, api_key)
+        if not collection:
+            return None
+        
+        # محاولة الحصول من عدة مصادر
+        twitter_username = None
+        
+        # 1. من حقل twitter_username
+        if collection.get("twitter_username"):
+            twitter_username = collection.get("twitter_username")
+            log.info(f"[X] ✅ وجدت حساب X: @{twitter_username}")
+            return twitter_username
+        
+        # 2. من external_url
+        external_url = collection.get("external_url", "")
+        if external_url:
+            if "twitter.com" in external_url or "x.com" in external_url:
+                # استخراج اسم المستخدم من الرابط
+                parts = external_url.split("/")
+                if parts:
+                    twitter_username = parts[-1]
+                    if twitter_username:
+                        log.info(f"[X] ✅ وجدت حساب X من الرابط: @{twitter_username}")
+                        return twitter_username
+        
+        # 3. من community_data
+        community = collection.get("community_data", {})
+        if community.get("twitter_username"):
+            twitter_username = community.get("twitter_username")
+            log.info(f"[X] ✅ وجدت حساب X من المجتمع: @{twitter_username}")
+            return twitter_username
+        
+        log.info(f"[X] ❌ لم يتم العثور على حساب X لـ {slug}")
+        return None
+        
+    except Exception as e:
+        log.warning(f"[X] ❌ خطأ لجلب حساب X لـ {slug}: {e}")
         return None
 
 
 def get_website_from_opensea(slug: str, api_key: str) -> Optional[str]:
-    """الحصول على الموقع الإلكتروني من OpenSea"""
+    """
+    الحصول على الموقع الإلكتروني من OpenSea
+    """
     try:
-        url = f"https://api.opensea.io/api/v2/collections/{slug}"
-        headers = {"x-api-key": api_key}
-        resp = requests.get(url, headers=headers, timeout=10)
+        collection = get_collection_details(slug, api_key)
+        if not collection:
+            return None
         
-        if resp.status_code == 200:
-            data = resp.json()
-            collection = data.get("collection", {})
-            
-            website = collection.get("external_url")
-            if website and website.startswith(("http://", "https://")):
+        website = None
+        
+        # 1. من external_url
+        external_url = collection.get("external_url", "")
+        if external_url and external_url.startswith(("http://", "https://")):
+            # التأكد من أنه ليس رابط تويتر
+            if "twitter.com" not in external_url and "x.com" not in external_url:
+                website = external_url
+                log.info(f"[موقع] ✅ وجدت موقع: {website}")
                 return website
-            
-            project_website = collection.get("project_website")
-            if project_website and project_website.startswith(("http://", "https://")):
-                return project_website
         
+        # 2. من project_website
+        project_website = collection.get("project_website", "")
+        if project_website and project_website.startswith(("http://", "https://")):
+            website = project_website
+            log.info(f"[موقع] ✅ وجدت موقع المشروع: {website}")
+            return website
+        
+        # 3. من community_data
+        community = collection.get("community_data", {})
+        if community.get("website"):
+            website = community.get("website")
+            if website.startswith(("http://", "https://")):
+                log.info(f"[موقع] ✅ وجدت موقع من المجتمع: {website}")
+                return website
+        
+        log.info(f"[موقع] ❌ لم يتم العثور على موقع لـ {slug}")
         return None
+        
     except Exception as e:
-        log.warning(f"[الموقع] خطأ لجلب الموقع لـ {slug}: {e}")
+        log.warning(f"[موقع] ❌ خطأ لجلب الموقع لـ {slug}: {e}")
         return None
 
 
@@ -382,14 +451,13 @@ def broadcast_message(text: str):
 
 
 def build_success_msg(detail: Dict[str, Any], result: Dict[str, Any], chain_key: str, twitter: str = None, website: str = None) -> str:
-    """بناء رسالة نجاح الشراء - نسخة محسنة"""
+    """بناء رسالة نجاح الشراء"""
     name = detail.get("collection_name") or detail.get("collection_slug") or "غير معروف"
     url = detail.get("opensea_url", "")
     chain_label = CHAIN_CONFIGS[chain_key]["label"]
     chain_emoji = CHAIN_CONFIGS[chain_key]["emoji"]
     w_short = result['wallet'][:6] + "..." + result['wallet'][-4:]
     
-    # حساب سعر التوكن بالدولار
     price_usd = (result.get('total_value_wei', 0) / 1e18) * get_eth_price_usd() if result.get('total_value_wei') else 0
     
     msg = (
@@ -419,7 +487,7 @@ def build_success_msg(detail: Dict[str, Any], result: Dict[str, Any], chain_key:
 
 
 def build_watching_msg(detail: Dict[str, Any], reason: str, price_usd: float = None, twitter: str = None, website: str = None) -> str:
-    """بناء رسالة المراقبة - نسخة محسنة"""
+    """بناء رسالة المراقبة"""
     name = detail.get("collection_name") or detail.get("collection_slug") or "غير معروف"
     url = detail.get("opensea_url", "")
     
@@ -451,7 +519,7 @@ def build_watching_msg(detail: Dict[str, Any], reason: str, price_usd: float = N
 
 
 def build_gaveup_msg(detail: Dict[str, Any], reason: str, twitter: str = None, website: str = None) -> str:
-    """بناء رسالة انتهاء الفرصة - نسخة محسنة"""
+    """بناء رسالة انتهاء الفرصة"""
     name = detail.get("collection_name") or detail.get("collection_slug") or "غير معروف"
     url = detail.get("opensea_url", "")
     
@@ -475,7 +543,7 @@ def build_gaveup_msg(detail: Dict[str, Any], reason: str, twitter: str = None, w
 
 
 def build_gas_alert_msg(slug: str, gas_fee_usd: float, twitter: str = None, website: str = None) -> str:
-    """بناء رسالة تنبيه الغاز - نسخة محسنة"""
+    """بناء رسالة تنبيه الغاز"""
     msg = (
         f"⚠️ <b>⚡ تنبيه: رسوم الغاز مرتفعة!</b>\n"
         f"{'═' * 30}\n"
@@ -625,9 +693,8 @@ async def try_buy_now_multi_wallet(
     onchain_price = await asyncio.to_thread(get_onchain_public_price_wei, w3, contract_address)
     price_wei = onchain_price if onchain_price is not None else int(stage.get("price", "0"))
 
-    # التحقق من السعر المجاني باستخدام الحد 0.01 دولار
     if not is_free_or_negligible(price_wei, eth_price_usd):
-        return None  # مدفوع → مراقبة
+        return None
 
     max_per_wallet_raw = stage.get("max_total_mintable_by_wallet") or stage.get("max_per_wallet")
     max_per_wallet = int(max_per_wallet_raw) if max_per_wallet_raw is not None else None
@@ -655,7 +722,7 @@ async def try_buy_now_multi_wallet(
 # ======================== تقييم المينتات ========================
 
 async def evaluate_new_mint(slug: str, chain_key: str):
-    """تقييم مينت جديد - يتطلب X أو موقع (أحدهما كافٍ)"""
+    """تقييم مينت جديد مع التحقق من X والموقع"""
     if (
         len(successful_mints.get(slug, set())) >= len(WALLETS_DATA)
         or slug in watchlist
@@ -668,34 +735,64 @@ async def evaluate_new_mint(slug: str, chain_key: str):
     try:
         found, detail = await asyncio.to_thread(fetch_drop_detail, slug)
         if not found or not detail or not detail.get("is_minting"):
+            in_flight.discard(slug)
             return
 
         stage = detail.get("active_stage")
         if not stage or not started_today_local(stage):
+            in_flight.discard(slug)
             return
 
         # ======================== التحقق من X والموقع (أحدهما كافٍ) ========================
+        log.info(f"[{slug}] 🔍 جاري التحقق من X والموقع...")
         
-        # 1. التحقق من وجود حساب X (تويتر)
-        twitter_username = await asyncio.to_thread(get_twitter_username_from_opensea, slug, OPENSEA_API_KEY)
+        # 1. جلب تفاصيل المجموعة (مرة واحدة للكل)
+        collection = await asyncio.to_thread(get_collection_details, slug, OPENSEA_API_KEY)
         
-        # 2. التحقق من وجود موقع إلكتروني (إذا كان مفعلاً)
+        # 2. استخراج X
+        twitter_username = None
+        if collection:
+            # محاولة من عدة مصادر
+            twitter_username = collection.get("twitter_username")
+            if not twitter_username:
+                external_url = collection.get("external_url", "")
+                if "twitter.com" in external_url or "x.com" in external_url:
+                    parts = external_url.split("/")
+                    if parts:
+                        twitter_username = parts[-1]
+            if not twitter_username:
+                community = collection.get("community_data", {})
+                twitter_username = community.get("twitter_username")
+        
+        # 3. استخراج الموقع
         website = None
-        if CHECK_WEBSITE:
-            website = await asyncio.to_thread(get_website_from_opensea, slug, OPENSEA_API_KEY)
+        if collection and CHECK_WEBSITE:
+            website = collection.get("external_url", "")
+            if website and not website.startswith(("http://", "https://")):
+                website = None
+            if not website:
+                website = collection.get("project_website", "")
+                if website and not website.startswith(("http://", "https://")):
+                    website = None
+            if not website:
+                community = collection.get("community_data", {})
+                website = community.get("website", "")
+                if website and not website.startswith(("http://", "https://")):
+                    website = None
 
-        # التحقق: يجب أن يكون لدينا X أو موقع
         has_twitter = bool(twitter_username)
-        has_website = bool(website) if CHECK_WEBSITE else True  # إذا كان CHECK_WEBSITE=false، نعتبر الموقع موجوداً
+        has_website = bool(website) if CHECK_WEBSITE else True
+        
+        log.info(f"[{slug}] 📊 X: {twitter_username if has_twitter else '❌'}, موقع: {website if has_website else '❌'}")
         
         if not (has_twitter or has_website):
             log.info(f"⏭️ تجاهل '{slug}': لا يوجد X ولا موقع")
             mark_rejected(slug)
             msg = build_watching_msg(detail, "لا يوجد حساب X ولا موقع إلكتروني")
             broadcast_message(msg)
+            in_flight.discard(slug)
             return
         
-        # سجل ما تم العثور عليه
         found_parts = []
         if has_twitter:
             found_parts.append(f"X: @{twitter_username}")
@@ -710,6 +807,7 @@ async def evaluate_new_mint(slug: str, chain_key: str):
         if contract_address:
             is_active, _ = await asyncio.to_thread(is_mint_active, w3, contract_address)
             if not is_active:
+                in_flight.discard(slug)
                 return
             
             onchain_price = await asyncio.to_thread(get_onchain_public_price_wei, w3, contract_address)
@@ -717,7 +815,6 @@ async def evaluate_new_mint(slug: str, chain_key: str):
             
             price_usd = (price_wei / 1e18) * eth_price_usd
             
-            # إذا كان المينت مدفوعاً، ضعه في قائمة المراقبة
             if not is_free_or_negligible(price_wei, eth_price_usd):
                 if slug not in watchlist:
                     watchlist[slug] = {"chain_key": chain_key, "detail": detail}
@@ -730,6 +827,7 @@ async def evaluate_new_mint(slug: str, chain_key: str):
                         website if has_website else None
                     )
                     broadcast_message(msg)
+                in_flight.discard(slug)
                 return
 
         # محاولة الشراء
@@ -740,7 +838,6 @@ async def evaluate_new_mint(slug: str, chain_key: str):
         )
 
         if results is None:
-            # مدفوع → مراقبة
             if slug not in watchlist:
                 watchlist[slug] = {"chain_key": chain_key, "detail": detail}
                 save_watchlist(slug, chain_key, detail)
@@ -751,9 +848,9 @@ async def evaluate_new_mint(slug: str, chain_key: str):
                     website=website if has_website else None
                 )
                 broadcast_message(msg)
+            in_flight.discard(slug)
             return
 
-        # تحديث قائمة المراقبة
         if len(successful_mints.get(slug, set())) < len(WALLETS_DATA):
             if slug not in watchlist:
                 watchlist[slug] = {"chain_key": chain_key, "detail": detail}
@@ -795,35 +892,47 @@ async def watch_loop():
                 if not found or not fresh_detail or not fresh_detail.get("is_minting"):
                     watchlist.pop(slug, None)
                     remove_from_watchlist(slug)
-                    
-                    twitter = await asyncio.to_thread(get_twitter_username_from_opensea, slug, OPENSEA_API_KEY)
-                    website = await asyncio.to_thread(get_website_from_opensea, slug, OPENSEA_API_KEY) if CHECK_WEBSITE else None
-                    
-                    broadcast_message(build_gaveup_msg(entry["detail"], "المينت لم يعد نشطاً", twitter, website))
+                    broadcast_message(build_gaveup_msg(entry["detail"], "المينت لم يعد نشطاً"))
+                    in_flight.discard(slug)
                     continue
 
                 stage = fresh_detail.get("active_stage")
                 if not stage or (stage_has_ended(stage) and not fresh_detail.get("next_stage")):
                     watchlist.pop(slug, None)
                     remove_from_watchlist(slug)
-                    
-                    twitter = await asyncio.to_thread(get_twitter_username_from_opensea, slug, OPENSEA_API_KEY)
-                    website = await asyncio.to_thread(get_website_from_opensea, slug, OPENSEA_API_KEY) if CHECK_WEBSITE else None
-                    
-                    broadcast_message(build_gaveup_msg(fresh_detail, "انتهت المرحلة", twitter, website))
+                    broadcast_message(build_gaveup_msg(fresh_detail, "انتهت المرحلة"))
+                    in_flight.discard(slug)
                     continue
 
-                # جلب معلومات X والموقع للتحديث
-                twitter = await asyncio.to_thread(get_twitter_username_from_opensea, slug, OPENSEA_API_KEY)
-                website = await asyncio.to_thread(get_website_from_opensea, slug, OPENSEA_API_KEY) if CHECK_WEBSITE else None
+                # جلب المعلومات مرة أخرى
+                collection = await asyncio.to_thread(get_collection_details, slug, OPENSEA_API_KEY)
+                twitter_username = None
+                website = None
+                
+                if collection:
+                    twitter_username = collection.get("twitter_username")
+                    if not twitter_username:
+                        external_url = collection.get("external_url", "")
+                        if "twitter.com" in external_url or "x.com" in external_url:
+                            parts = external_url.split("/")
+                            if parts:
+                                twitter_username = parts[-1]
+                    
+                    if CHECK_WEBSITE:
+                        website = collection.get("external_url", "")
+                        if website and not website.startswith(("http://", "https://")):
+                            website = None
+                        if not website:
+                            website = collection.get("project_website", "")
+                            if website and not website.startswith(("http://", "https://")):
+                                website = None
 
-                # محاولة الشراء مجدداً
-                results = await try_buy_now_multi_wallet(slug, chain_key, fresh_detail, twitter, website)
+                results = await try_buy_now_multi_wallet(slug, chain_key, fresh_detail, twitter_username, website)
 
                 if results is None:
-                    # لا يزال مدفوعاً
                     watchlist[slug] = {"chain_key": chain_key, "detail": fresh_detail}
                     save_watchlist(slug, chain_key, fresh_detail)
+                    in_flight.discard(slug)
                     continue
 
                 if len(successful_mints.get(slug, set())) >= len(WALLETS_DATA):
@@ -913,7 +1022,6 @@ async def run():
         await shutdown_event.wait()
         return
 
-    # تهيئة قاعدة البيانات
     await asyncio.to_thread(init_database)
     await asyncio.to_thread(load_state_from_db)
     
