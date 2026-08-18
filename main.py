@@ -2,9 +2,7 @@
 النظام الكامل — 10 محافظ، لكل محفظة بوت تيليجرام خاص بها:
   - يكتشف مينتات اليوم على Robinhood + Ethereum
   - يشتري لجميع المحافظ المعرفة بالتوازي (Parallel Execution)
-  - يرسل إشعار الشراء أو التحديث لكل محفظة على بوت التيليجرام الخاص بها
-  - يراقب المينتات المدفوعة التي قد تتحول لمرحلة مجانية
-  - مراقبة ذكية بأولويات متغيرة للحفاظ على السرعة
+  - يرسل إشعارات فقط للمينتات القادمة وعند نجاح الشراء
   - يتعامل مع المينتات التي لم تبدأ بعد أو انتهت
   - يعرض روابط المينت في رسائل التيليجرام
 """
@@ -86,12 +84,11 @@ class WatchlistEntry:
     was_paid: bool = False
     last_price_usd: float = 0.0
     priority: WatchPriority = WatchPriority.NORMAL
-    last_notification_time: float = 0
-    notification_interval: int = 300
     mint_status: MintStatus = MintStatus.UNKNOWN
     mint_start_time: Optional[int] = None
     mint_end_time: Optional[int] = None
     waiting_since: Optional[float] = None
+    start_notified: bool = False
 
 class Config:
     """إدارة الإعدادات من ملف .env"""
@@ -122,7 +119,7 @@ class Config:
         # تحميل المحافظ
         self.wallets = self._load_wallets()
         
-        # إعدادات المراقبة
+        # إعدادات المراقبة - استخدام القيم الافتراضية فقط
         self.heartbeat_interval = int(self._get_env("HEARTBEAT_INTERVAL", "20"))
         self.recv_timeout = int(self._get_env("RECV_TIMEOUT", "5"))
         self.watch_poll_interval = int(self._get_env("WATCH_POLL_INTERVAL", "15"))
@@ -131,13 +128,12 @@ class Config:
         self.max_watchlist_size = int(self._get_env("MAX_WATCHLIST_SIZE", "50"))
         self.min_balance_reserve_usd = float(self._get_env("MIN_BALANCE_RESERVE_USD", "0.10"))
         
-        # عتبات الأولوية
-        self.urgent_price_threshold = float(self._get_env("URGENT_PRICE_THRESHOLD", "0.05"))
-        self.normal_check_interval = int(self._get_env("NORMAL_CHECK_INTERVAL", "30"))
-        self.low_check_interval = int(self._get_env("LOW_CHECK_INTERVAL", "60"))
-        
-        # إعدادات الانتظار
-        self.max_wait_time = int(self._get_env("MAX_WAIT_TIME", "3600"))
+        # قيم ثابتة داخل الكود
+        self.urgent_price_threshold = 0.05
+        self.normal_check_interval = 30
+        self.low_check_interval = 60
+        self.max_wait_time = 3600  # ساعة كحد أقصى
+        self.notify_before_start = 300  # إشعار قبل 5 دقائق
         
     def _get_env(self, key: str, default: str = "", required: bool = False) -> str:
         value = os.environ.get(key, default).strip()
@@ -400,7 +396,7 @@ class TelegramManager:
                         "chat_id": msg["chat_id"],
                         "text": msg["text"],
                         "parse_mode": "HTML",
-                        "disable_web_page_preview": False,  # ✅ السماح بمعاينة الروابط
+                        "disable_web_page_preview": False,
                     },
                     timeout=10,
                 )
@@ -428,37 +424,21 @@ class TelegramManager:
 telegram_manager = TelegramManager()
 
 # ---------------------------------------------------------------------------
-# ✅ دوال بناء الروابط
+# دوال بناء الروابط
 # ---------------------------------------------------------------------------
 
 def get_opensea_url(detail: dict) -> str:
-    """استخراج رابط OpenSea من تفاصيل المينت"""
-    # محاولة الحصول على الرابط المباشر
     url = detail.get("opensea_url", "")
     if url:
         return url
     
-    # بناء الرابط من slug
     slug = detail.get("collection_slug") or detail.get("collection_name", "")
     if slug:
         return f"https://opensea.io/collection/{slug}"
     
     return ""
 
-def get_contract_url(chain_key: str, contract_address: str) -> str:
-    """بناء رابط العقد الذكي"""
-    if not contract_address:
-        return ""
-    
-    if chain_key == "ethereum":
-        return f"https://etherscan.io/address/{contract_address}"
-    elif chain_key == "robinhood":
-        return f"https://robinhoodscan.com/address/{contract_address}"
-    
-    return ""
-
 def get_tx_url(chain_key: str, tx_hash: str) -> str:
-    """بناء رابط المعاملة"""
     if not tx_hash:
         return ""
     
@@ -470,11 +450,36 @@ def get_tx_url(chain_key: str, tx_hash: str) -> str:
     return ""
 
 # ---------------------------------------------------------------------------
-# ✅ بناء الرسائل مع الروابط
+# بناء الرسائل (فقط للبدء والشراء)
 # ---------------------------------------------------------------------------
 
+def build_start_notification(detail: dict, wait_seconds: int) -> str:
+    """بناء رسالة إشعار بدء المينت"""
+    name = detail.get("collection_name") or detail.get("collection_slug", "Unknown")
+    opensea_url = get_opensea_url(detail)
+    
+    wait_minutes = wait_seconds // 60
+    wait_secs = wait_seconds % 60
+    
+    if wait_minutes > 0:
+        time_str = f"{wait_minutes} دقيقة و {wait_secs} ثانية"
+    else:
+        time_str = f"{wait_secs} ثانية"
+    
+    message = (
+        f"🔔 <b>مينت قادم!</b>\n\n"
+        f"المجموعة: <b>{name}</b>\n"
+        f"يبدأ خلال: {time_str}\n"
+        f"سنقوم بالشراء تلقائياً عند البدء."
+    )
+    
+    if opensea_url:
+        message += f"\n\n🔗 <a href='{opensea_url}'>OpenSea</a>"
+    
+    return message
+
 def build_success_message(wallet_config: WalletConfig, result: dict, detail: dict) -> str:
-    """بناء رسالة نجاح مع الروابط"""
+    """بناء رسالة نجاح الشراء"""
     name = detail.get("collection_name") or detail.get("collection_slug", "Unknown")
     opensea_url = get_opensea_url(detail)
     chain_label = "Robinhood Chain" if wallet_config.chain_key == "robinhood" else "Ethereum Mainnet"
@@ -490,91 +495,11 @@ def build_success_message(wallet_config: WalletConfig, result: dict, detail: dic
         f"رسوم الغاز: ${result.get('gas_fee_usd', 0):.4f}\n"
     )
     
-    # ✅ إضافة روابط
     if opensea_url:
         message += f"\n🔗 <a href='{opensea_url}'>OpenSea</a>"
     
     if tx_url:
         message += f"\n📝 <a href='{tx_url}'>المعاملة</a>"
-    
-    return message
-
-def build_watching_message(detail: dict, reason: str) -> str:
-    """بناء رسالة مراقبة مع الروابط"""
-    name = detail.get("collection_name") or detail.get("collection_slug", "Unknown")
-    opensea_url = get_opensea_url(detail)
-    
-    message = (
-        f"👀 <b>تحت المراقبة</b>\n\n"
-        f"المجموعة: <b>{name}</b>\n"
-        f"السبب: {reason}\n"
-        f"سنحاول الشراء تلقائيًا فور توفر الفرصة."
-    )
-    
-    # ✅ إضافة رابط
-    if opensea_url:
-        message += f"\n\n🔗 <a href='{opensea_url}'>OpenSea</a>"
-    
-    return message
-
-def build_waiting_message(detail: dict, wait_seconds: int) -> str:
-    """بناء رسالة انتظار مع الروابط"""
-    name = detail.get("collection_name") or detail.get("collection_slug", "Unknown")
-    opensea_url = get_opensea_url(detail)
-    wait_minutes = wait_seconds // 60
-    wait_secs = wait_seconds % 60
-    
-    if wait_minutes > 0:
-        time_str = f"{wait_minutes} دقيقة و {wait_secs} ثانية"
-    else:
-        time_str = f"{wait_secs} ثانية"
-    
-    message = (
-        f"⏰ <b>في انتظار بدء المينت</b>\n\n"
-        f"المجموعة: <b>{name}</b>\n"
-        f"يبدأ خلال: {time_str}\n"
-        f"سنقوم بالشراء تلقائياً عند البدء."
-    )
-    
-    # ✅ إضافة رابط
-    if opensea_url:
-        message += f"\n\n🔗 <a href='{opensea_url}'>OpenSea</a>"
-    
-    return message
-
-def build_price_drop_message(detail: dict, old_price: float, new_price: float) -> str:
-    """بناء رسالة انخفاض السعر مع الروابط"""
-    name = detail.get("collection_name") or detail.get("collection_slug", "Unknown")
-    opensea_url = get_opensea_url(detail)
-    
-    message = (
-        f"🎉 <b>انخفض السعر!</b>\n\n"
-        f"المجموعة: <b>{name}</b>\n"
-        f"السعر القديم: ${old_price:.4f}\n"
-        f"السعر الجديد: ${new_price:.4f}\n"
-        f"جاري محاولة الشراء..."
-    )
-    
-    # ✅ إضافة رابط
-    if opensea_url:
-        message += f"\n\n🔗 <a href='{opensea_url}'>OpenSea</a>"
-    
-    return message
-
-def build_gave_up_message(detail: dict, reason: str) -> str:
-    """بناء رسالة إلغاء مع الروابط"""
-    name = detail.get("collection_name") or detail.get("collection_slug", "Unknown")
-    opensea_url = get_opensea_url(detail)
-    
-    message = (
-        f"❌ <b>انتهت الفرصة</b>\n\n"
-        f"المجموعة: <b>{name}</b>\n"
-        f"السبب: {reason}"
-    )
-    
-    # ✅ إضافة رابط
-    if opensea_url:
-        message += f"\n\n🔗 <a href='{opensea_url}'>OpenSea</a>"
     
     return message
 
@@ -626,7 +551,7 @@ async def purchase_for_wallet(
                     successful_mints[slug] = set()
                 successful_mints[slug].add(wallet_addr)
                 
-                # ✅ إرسال إشعار النجاح مع الرابط
+                # إرسال إشعار النجاح فقط
                 message = build_success_message(wallet_config, result, wallet_config.current_detail)
                 telegram_manager.enqueue(
                     wallet_config.bot_token,
@@ -664,7 +589,6 @@ async def try_buy_now_multi_wallet(
     w3 = w3_instances[chain_key]
     eth_price_usd = get_eth_price_usd()
     
-    # فحص حالة المينت
     mint_status, start_time, end_time = get_mint_status(w3, contract_address)
     
     if mint_status == MintStatus.NOT_STARTED:
@@ -801,6 +725,7 @@ async def evaluate_new_mint(slug: str, chain_key: str):
         if contract_address:
             mint_status, start_time, end_time = get_mint_status(w3, contract_address)
             
+            # المينت لم يبدأ بعد
             if mint_status == MintStatus.NOT_STARTED:
                 wait_seconds = start_time - int(time.time())
                 
@@ -821,18 +746,21 @@ async def evaluate_new_mint(slug: str, chain_key: str):
                     )
                     watchlist[slug] = entry
                     
-                    # ✅ إشعار الانتظار مع الرابط
-                    message = build_waiting_message(detail, wait_seconds)
-                    telegram_manager.broadcast(message, config.wallets)
+                    # إرسال إشعار البدء فقط إذا كان سيبدأ خلال 5 دقائق
+                    if wait_seconds <= config.notify_before_start:
+                        message = build_start_notification(detail, wait_seconds)
+                        telegram_manager.broadcast(message, config.wallets)
                 else:
                     log.info(f"⏰ '{slug}' سيبدأ بعد وقت طويل ({wait_seconds} ثانية) - تجاهل")
                 
                 return
             
+            # المينت انتهى
             if mint_status == MintStatus.ENDED:
                 log.info(f"⏰ '{slug}' انتهى بالفعل - تجاهل")
                 return
             
+            # المينت نشط - فحص السعر
             onchain_price = await asyncio.to_thread(
                 get_onchain_public_price_wei,
                 w3,
@@ -841,6 +769,7 @@ async def evaluate_new_mint(slug: str, chain_key: str):
             price_wei = onchain_price if onchain_price is not None else int(stage.get("price", "0"))
             price_usd = calculate_price_usd(price_wei, eth_price_usd)
         
+        # المينت مجاني ونشط - فحص تويتر والشراء
         if price_wei is None or is_free_or_negligible(price_wei, eth_price_usd):
             log.info(f"🆓 '{slug}' مجاني (${price_usd:.4f}) - فحص تويتر والشراء")
             
@@ -856,7 +785,8 @@ async def evaluate_new_mint(slug: str, chain_key: str):
             results = await try_buy_now_multi_wallet(slug, chain_key, detail)
             
             if results is None:
-                await add_to_watchlist(slug, chain_key, detail, "السعر الحالي مدفوع")
+                # مدفوع - أضف للمراقبة بدون إشعار
+                await add_to_watchlist_silent(slug, chain_key, detail)
                 return
             
             if any(r.get("reason") == "mint_not_started" for r in results):
@@ -867,8 +797,9 @@ async def evaluate_new_mint(slug: str, chain_key: str):
                 return
             
             if len(successful_mints.get(slug, set())) < len(config.wallets):
-                await add_to_watchlist(slug, chain_key, detail, "لم تكتمل كل المحافظ")
+                await add_to_watchlist_silent(slug, chain_key, detail)
         
+        # المينت مدفوع - أضف للمراقبة بدون إشعار
         else:
             log.info(f"💰 '{slug}' مدفوع (${price_usd:.4f}) - إضافة للمراقبة")
             
@@ -886,20 +817,15 @@ async def evaluate_new_mint(slug: str, chain_key: str):
                 mint_end_time=end_time if 'end_time' in locals() else None,
             )
             watchlist[slug] = entry
-            
-            # ✅ إشعار المراقبة مع الرابط
-            message = build_watching_message(
-                detail, 
-                f"مدفوع (${price_usd:.4f}) - أولوية {priority.value}"
-            )
-            telegram_manager.broadcast(message, config.wallets)
+            # لا إشعار هنا
     
     except Exception as e:
         log.error(f"خطأ بتقييم '{slug}': {e}", exc_info=True)
     finally:
         in_flight.discard(slug)
 
-async def add_to_watchlist(slug: str, chain_key: str, detail: dict, reason: str):
+async def add_to_watchlist_silent(slug: str, chain_key: str, detail: dict):
+    """إضافة للمراقبة بدون إشعار"""
     if len(watchlist) >= config.max_watchlist_size:
         log.warning(f"قائمة المراقبة ممتلئة ({config.max_watchlist_size}). تجاهل '{slug}'")
         return
@@ -914,10 +840,6 @@ async def add_to_watchlist(slug: str, chain_key: str, detail: dict, reason: str)
         added_at=time.time(),
     )
     watchlist[slug] = entry
-    
-    # ✅ إشعار المراقبة مع الرابط
-    message = build_watching_message(detail, reason)
-    telegram_manager.broadcast(message, config.wallets)
 
 # ---------------------------------------------------------------------------
 # حلقة المراقبة الذكية
@@ -982,8 +904,6 @@ async def check_watchlist_entry(slug: str, entry: WatchlistEntry):
     
     if entry.check_count >= entry.max_checks:
         watchlist.pop(slug, None)
-        message = build_gave_up_message(entry.detail, "تجاوز الحد الأقصى للمحاولات")
-        telegram_manager.broadcast(message, config.wallets)
         return
     
     if entry.mint_status == MintStatus.NOT_STARTED and entry.waiting_since:
@@ -1007,15 +927,11 @@ async def check_watchlist_entry(slug: str, entry: WatchlistEntry):
         
         if not found or not fresh_detail or not fresh_detail.get("is_minting"):
             watchlist.pop(slug, None)
-            message = build_gave_up_message(entry.detail, "المينت لم يعد نشطًا")
-            telegram_manager.broadcast(message, config.wallets)
             return
         
         stage = fresh_detail.get("active_stage")
         if not stage:
             watchlist.pop(slug, None)
-            message = build_gave_up_message(fresh_detail, "لا توجد مرحلة نشطة")
-            telegram_manager.broadcast(message, config.wallets)
             return
         
         w3 = w3_instances[entry.chain_key]
@@ -1026,6 +942,7 @@ async def check_watchlist_entry(slug: str, entry: WatchlistEntry):
         
         mint_status, start_time, end_time = get_mint_status(w3, contract_address)
         
+        # المينت لم يبدأ بعد
         if mint_status == MintStatus.NOT_STARTED:
             entry.mint_status = MintStatus.NOT_STARTED
             entry.mint_start_time = start_time
@@ -1036,29 +953,28 @@ async def check_watchlist_entry(slug: str, entry: WatchlistEntry):
             
             wait_seconds = start_time - int(time.time()) if start_time else 0
             
-            if now - entry.last_notification_time > entry.notification_interval:
-                # ✅ إشعار الانتظار مع الرابط
-                message = build_waiting_message(fresh_detail, wait_seconds)
+            # إرسال إشعار البدء فقط إذا لم يتم إرساله من قبل وسيبدأ خلال 5 دقائق
+            if not entry.start_notified and wait_seconds <= config.notify_before_start:
+                message = build_start_notification(fresh_detail, wait_seconds)
                 telegram_manager.broadcast(message, config.wallets)
-                entry.last_notification_time = now
+                entry.start_notified = True
+                log.info(f"🔔 إرسال إشعار بدء '{slug}' - متبقي {wait_seconds} ثانية")
             
             log.info(f"⏰ '{slug}' لم يبدأ بعد - متبقي {wait_seconds} ثانية")
             return
         
+        # المينت انتهى
         if mint_status == MintStatus.ENDED:
             watchlist.pop(slug, None)
-            message = build_gave_up_message(fresh_detail, "انتهى المينت")
-            telegram_manager.broadcast(message, config.wallets)
             return
         
+        # المينت نشط
         entry.mint_status = MintStatus.ACTIVE
         entry.mint_start_time = start_time
         entry.mint_end_time = end_time
         
         if stage_has_ended(stage) and not fresh_detail.get("next_stage"):
             watchlist.pop(slug, None)
-            message = build_gave_up_message(fresh_detail, "انتهت المرحلة")
-            telegram_manager.broadcast(message, config.wallets)
             return
         
         eth_price_usd = get_eth_price_usd()
@@ -1077,24 +993,11 @@ async def check_watchlist_entry(slug: str, entry: WatchlistEntry):
         
         entry.priority = determine_priority(price_usd)
         
+        # السعر مجاني - شراء
         if is_free_or_negligible(price_wei, eth_price_usd):
-            if entry.was_paid and entry.last_price_usd > 0:
-                log.info(f"🎉 '{slug}' انخفض سعره من ${entry.last_price_usd:.4f} إلى ${price_usd:.4f}!")
-                
-                if now - entry.last_notification_time > entry.notification_interval:
-                    # ✅ إشعار انخفاض السعر مع الرابط
-                    message = build_price_drop_message(
-                        fresh_detail,
-                        entry.last_price_usd,
-                        price_usd
-                    )
-                    telegram_manager.broadcast(message, config.wallets)
-                    entry.last_notification_time = now
-            
             has_twitter, twitter_username = await check_twitter(slug, entry)
             
             if not has_twitter:
-                log.info(f"⏭️ '{slug}': لا يوجد حساب X مربوط.")
                 watchlist.pop(slug, None)
                 rejection_manager.mark_rejected(slug)
                 return
@@ -1122,6 +1025,7 @@ async def check_watchlist_entry(slug: str, entry: WatchlistEntry):
                 entry.was_paid = False
                 entry.last_price_usd = price_usd
         
+        # المينت لا يزال مدفوعاً
         else:
             entry.detail = fresh_detail
             entry.was_paid = True
@@ -1290,8 +1194,9 @@ async def run():
         await telegram_manager.send_queue.join()
         return
     
+    # إشعار التشغيل فقط
     telegram_manager.broadcast(
-        "✅ تم تشغيل المحفظة الخاصة بك بنجاح وربطها بهذا البوت!",
+        "✅ تم تشغيل النظام بنجاح!",
         config.wallets
     )
     
