@@ -5,6 +5,7 @@
   - يرسل إشعار الشراء أو التحديث لكل محفظة على بوت التيليجرام الخاص بها
   - يراقب المينتات المدفوعة التي قد تتحول لمرحلة مجانية
   - مراقبة ذكية بأولويات متغيرة للحفاظ على السرعة
+  - يتعامل مع المينتات التي لم تبدأ بعد أو انتهت
 """
 
 import asyncio
@@ -26,6 +27,7 @@ from buyer import (
     get_web3,
     attempt_purchase_single_wallet,
     get_onchain_public_price_wei,
+    get_mint_times,  # ✅ إضافة استيراد
     LockManager,
     purchase_with_retry,
 )
@@ -42,6 +44,13 @@ class WatchPriority(Enum):
     URGENT = "urgent"      # فحص كل 15 ثانية
     NORMAL = "normal"      # فحص كل 30 ثانية
     LOW = "low"            # فحص كل 60 ثانية
+
+class MintStatus(Enum):
+    """حالة المينت"""
+    NOT_STARTED = "not_started"  # لم يبدأ بعد
+    ACTIVE = "active"            # نشط حالياً
+    ENDED = "ended"              # انتهى
+    UNKNOWN = "unknown"          # غير معروف
 
 @dataclass
 class ChainConfig:
@@ -70,7 +79,7 @@ class WatchlistEntry:
     added_at: float
     last_check: float = 0
     check_count: int = 0
-    max_checks: int = 200  # حد أقصى للمراقبة
+    max_checks: int = 500  # زيادة الحد الأقصى للمراقبة الطويلة
     twitter_checked: bool = False
     twitter_username: Optional[str] = None
     was_paid: bool = False
@@ -78,6 +87,10 @@ class WatchlistEntry:
     priority: WatchPriority = WatchPriority.NORMAL
     last_notification_time: float = 0
     notification_interval: int = 300  # 5 دقائق بين الإشعارات
+    mint_status: MintStatus = MintStatus.UNKNOWN  # ✅ حالة المينت
+    mint_start_time: Optional[int] = None  # ✅ وقت البداية
+    mint_end_time: Optional[int] = None  # ✅ وقت النهاية
+    waiting_since: Optional[float] = None  # ✅ متى بدأنا الانتظار
 
 class Config:
     """إدارة الإعدادات من ملف .env"""
@@ -121,6 +134,9 @@ class Config:
         self.urgent_price_threshold = float(self._get_env("URGENT_PRICE_THRESHOLD", "0.05"))
         self.normal_check_interval = int(self._get_env("NORMAL_CHECK_INTERVAL", "30"))
         self.low_check_interval = int(self._get_env("LOW_CHECK_INTERVAL", "60"))
+        
+        # ✅ إعدادات الانتظار
+        self.max_wait_time = int(self._get_env("MAX_WAIT_TIME", "3600"))  # ساعة كحد أقصى للانتظار
         
     def _get_env(self, key: str, default: str = "", required: bool = False) -> str:
         """جلب قيمة من البيئة مع التحقق من وجودها"""
@@ -181,7 +197,7 @@ lock_manager = LockManager()
 successful_mints: Dict[str, set] = {}
 watchlist: Dict[str, WatchlistEntry] = {}
 in_flight: Set[str] = set()
-known_slugs: Set[str] = set()  # لتتبع كل الـ slugs المعروفة
+known_slugs: Set[str] = set()
 
 # Cache لسعر ETH
 _eth_price_cache = {"value": None, "ts": 0, "ttl": 300}
@@ -217,10 +233,35 @@ def determine_priority(price_usd: float) -> WatchPriority:
     """تحديد أولوية المراقبة بناءً على السعر"""
     if price_usd < config.urgent_price_threshold:
         return WatchPriority.URGENT
-    elif price_usd < 0.5:  # أقل من 50 سنت
+    elif price_usd < 0.5:
         return WatchPriority.NORMAL
     else:
         return WatchPriority.LOW
+
+# ---------------------------------------------------------------------------
+# فحص حالة المينت
+# ---------------------------------------------------------------------------
+
+def get_mint_status(w3: Web3, contract_address: str) -> Tuple[MintStatus, Optional[int], Optional[int]]:
+    """فحص حالة المينت من السلسلة"""
+    try:
+        start_time, end_time = get_mint_times(w3, contract_address)
+        current_time = int(time.time())
+        
+        if start_time and current_time < start_time:
+            return MintStatus.NOT_STARTED, start_time, end_time
+        
+        if end_time and current_time > end_time:
+            return MintStatus.ENDED, start_time, end_time
+        
+        if start_time and end_time:
+            return MintStatus.ACTIVE, start_time, end_time
+        
+        return MintStatus.UNKNOWN, start_time, end_time
+        
+    except Exception as e:
+        log.warning(f"[حالة المينت] تعذر الفحص: {e}")
+        return MintStatus.UNKNOWN, None, None
 
 # ---------------------------------------------------------------------------
 # إدارة التخزين المؤقت للرفض
@@ -273,12 +314,11 @@ class OpenSeaAPI:
         self.api_key = api_key
         self.base_url = "https://api.opensea.io/api/v2"
         self._cache: Dict[str, Tuple[float, Dict]] = {}
-        self._cache_ttl = 30  # 30 ثانية cache
+        self._cache_ttl = 30
     
     def fetch_drop_detail(self, slug: str, use_cache: bool = True) -> Tuple[bool, Optional[Dict]]:
         """جلب تفاصيل drop محدد مع cache"""
         
-        # استخدام cache إذا كان متاحاً وحديثاً
         if use_cache and slug in self._cache:
             timestamp, data = self._cache[slug]
             if time.time() - timestamp < self._cache_ttl:
@@ -293,7 +333,6 @@ class OpenSeaAPI:
             
             if resp.status_code == 200:
                 data = resp.json()
-                # تحديث cache
                 self._cache[slug] = (time.time(), data)
                 return True, data
             elif resp.status_code == 404:
@@ -333,7 +372,7 @@ class TelegramManager:
         self.max_per_second = max_messages_per_second
         self.last_send: Dict[str, float] = {}
         self._sender_task: Optional[asyncio.Task] = None
-        self._recent_messages: Dict[str, float] = {}  # لمنع تكرار الرسائل
+        self._recent_messages: Dict[str, float] = {}
     
     async def start(self):
         """بدء معالج الإرسال"""
@@ -351,7 +390,6 @@ class TelegramManager:
     def enqueue(self, bot_token: str, chat_id: str, text: str, deduplicate: bool = True):
         """إضافة رسالة للطابور مع منع التكرار"""
         
-        # منع تكرار نفس الرسالة خلال 5 ثواني
         if deduplicate:
             msg_key = f"{bot_token}:{chat_id}:{text[:100]}"
             last_time = self._recent_messages.get(msg_key, 0)
@@ -380,10 +418,8 @@ class TelegramManager:
             try:
                 msg = await self.send_queue.get()
                 
-                # Rate limiting
                 await self._wait_for_rate_limit(msg["bot_token"])
                 
-                # إرسال الرسالة
                 telegram_api = f"https://api.telegram.org/bot{msg['bot_token']}"
                 response = await asyncio.to_thread(
                     requests.post,
@@ -448,6 +484,24 @@ def build_watching_message(detail: dict, reason: str) -> str:
         f"المجموعة: <b>{name}</b>\n"
         f"السبب: {reason}\n"
         f"سنحاول الشراء تلقائيًا فور توفر الفرصة."
+    )
+
+def build_waiting_message(detail: dict, wait_seconds: int) -> str:
+    """بناء رسالة انتظار"""
+    name = detail.get("collection_name") or detail.get("collection_slug", "Unknown")
+    wait_minutes = wait_seconds // 60
+    wait_secs = wait_seconds % 60
+    
+    if wait_minutes > 0:
+        time_str = f"{wait_minutes} دقيقة و {wait_secs} ثانية"
+    else:
+        time_str = f"{wait_secs} ثانية"
+    
+    return (
+        f"⏰ <b>في انتظار بدء المينت</b>\n\n"
+        f"المجموعة: <b>{name}</b>\n"
+        f"يبدأ خلال: {time_str}\n"
+        f"سنقوم بالشراء تلقائياً عند البدء."
     )
 
 def build_price_drop_message(detail: dict, old_price: float, new_price: float) -> str:
@@ -561,6 +615,18 @@ async def try_buy_now_multi_wallet(
     w3 = w3_instances[chain_key]
     eth_price_usd = get_eth_price_usd()
     
+    # ✅ فحص حالة المينت قبل الشراء
+    mint_status, start_time, end_time = get_mint_status(w3, contract_address)
+    
+    if mint_status == MintStatus.NOT_STARTED:
+        wait_seconds = start_time - int(time.time())
+        log.info(f"⏰ '{slug}' لم يبدأ بعد. الانتظار {wait_seconds} ثانية")
+        return [{"success": False, "reason": "mint_not_started", "wait_seconds": wait_seconds}]
+    
+    if mint_status == MintStatus.ENDED:
+        log.info(f"⏰ '{slug}' انتهى بالفعل")
+        return [{"success": False, "reason": "mint_ended"}]
+    
     # جلب السعر من السلسلة
     onchain_price = await asyncio.to_thread(
         get_onchain_public_price_wei,
@@ -663,7 +729,7 @@ async def evaluate_new_mint(slug: str, chain_key: str):
     
     # فحص سريع أولي
     if slug in known_slugs:
-        return  # تمت معالجته مسبقاً
+        return
     
     # التحقق من الحالة
     if (
@@ -693,7 +759,7 @@ async def evaluate_new_mint(slug: str, chain_key: str):
         if not stage or not started_today_local(stage):
             return
         
-        # فحص السعر
+        # فحص السعر والحالة
         w3 = w3_instances[chain_key]
         eth_price_usd = get_eth_price_usd()
         contract_address = detail.get("contract_address")
@@ -702,6 +768,45 @@ async def evaluate_new_mint(slug: str, chain_key: str):
         price_usd = 0.0
         
         if contract_address:
+            # ✅ فحص حالة المينت
+            mint_status, start_time, end_time = get_mint_status(w3, contract_address)
+            
+            # المينت لم يبدأ بعد
+            if mint_status == MintStatus.NOT_STARTED:
+                wait_seconds = start_time - int(time.time())
+                
+                # إذا كان الانتظار قصيراً (أقل من ساعة)، أضف للمراقبة
+                if wait_seconds < config.max_wait_time:
+                    log.info(f"⏰ '{slug}' سيبدأ خلال {wait_seconds} ثانية - إضافة للمراقبة")
+                    
+                    entry = WatchlistEntry(
+                        chain_key=chain_key,
+                        detail=detail,
+                        added_at=time.time(),
+                        was_paid=True,
+                        last_price_usd=0,
+                        priority=WatchPriority.URGENT,  # ✅ أولوية عالية للانتظار القصير
+                        mint_status=MintStatus.NOT_STARTED,
+                        mint_start_time=start_time,
+                        mint_end_time=end_time,
+                        waiting_since=time.time(),
+                    )
+                    watchlist[slug] = entry
+                    
+                    # إشعار الانتظار
+                    message = build_waiting_message(detail, wait_seconds)
+                    telegram_manager.broadcast(message, config.wallets)
+                else:
+                    log.info(f"⏰ '{slug}' سيبدأ بعد وقت طويل ({wait_seconds} ثانية) - تجاهل")
+                
+                return
+            
+            # المينت انتهى
+            if mint_status == MintStatus.ENDED:
+                log.info(f"⏰ '{slug}' انتهى بالفعل - تجاهل")
+                return
+            
+            # المينت نشط - فحص السعر
             onchain_price = await asyncio.to_thread(
                 get_onchain_public_price_wei,
                 w3,
@@ -710,7 +815,7 @@ async def evaluate_new_mint(slug: str, chain_key: str):
             price_wei = onchain_price if onchain_price is not None else int(stage.get("price", "0"))
             price_usd = calculate_price_usd(price_wei, eth_price_usd)
         
-        # ✅ المينت مجاني - فحص تويتر والشراء فوراً
+        # ✅ المينت مجاني ونشط - فحص تويتر والشراء فوراً
         if price_wei is None or is_free_or_negligible(price_wei, eth_price_usd):
             log.info(f"🆓 '{slug}' مجاني (${price_usd:.4f}) - فحص تويتر والشراء")
             
@@ -731,10 +836,19 @@ async def evaluate_new_mint(slug: str, chain_key: str):
                 await add_to_watchlist(slug, chain_key, detail, "السعر الحالي مدفوع")
                 return
             
+            # فحص نتائج الشراء
+            if any(r.get("reason") == "mint_not_started" for r in results):
+                log.info(f"⏰ '{slug}' لم يبدأ بعد - إضافة للمراقبة")
+                # تحديث حالة المراقبة
+                if slug in watchlist:
+                    watchlist[slug].mint_status = MintStatus.NOT_STARTED
+                    watchlist[slug].waiting_since = time.time()
+                return
+            
             if len(successful_mints.get(slug, set())) < len(config.wallets):
                 await add_to_watchlist(slug, chain_key, detail, "لم تكتمل كل المحافظ")
         
-        # ⚠️ المينت مدفوع - أضف للمراقبة بدون فحص تويتر (تأجيل للسرعة)
+        # ⚠️ المينت مدفوع - أضف للمراقبة بدون فحص تويتر
         else:
             log.info(f"💰 '{slug}' مدفوع (${price_usd:.4f}) - إضافة للمراقبة")
             
@@ -749,6 +863,9 @@ async def evaluate_new_mint(slug: str, chain_key: str):
                 was_paid=True,
                 last_price_usd=price_usd,
                 priority=priority,
+                mint_status=MintStatus.ACTIVE,
+                mint_start_time=start_time if 'start_time' in locals() else None,
+                mint_end_time=end_time if 'end_time' in locals() else None,
             )
             watchlist[slug] = entry
             
@@ -863,6 +980,14 @@ async def check_watchlist_entry(slug: str, entry: WatchlistEntry):
         telegram_manager.broadcast(message, config.wallets)
         return
     
+    # ✅ التحقق من وقت الانتظار الطويل
+    if entry.mint_status == MintStatus.NOT_STARTED and entry.waiting_since:
+        wait_duration = time.time() - entry.waiting_since
+        if wait_duration > config.max_wait_time:
+            watchlist.pop(slug, None)
+            log.info(f"⏰ '{slug}' تم الانتظار لفترة طويلة ({wait_duration:.0f} ثانية) - إلغاء")
+            return
+    
     in_flight.add(slug)
     entry.check_count += 1
     entry.last_check = time.time()
@@ -883,19 +1008,63 @@ async def check_watchlist_entry(slug: str, entry: WatchlistEntry):
         
         # التحقق من المرحلة
         stage = fresh_detail.get("active_stage")
-        if not stage or (stage_has_ended(stage) and not fresh_detail.get("next_stage")):
+        if not stage:
+            watchlist.pop(slug, None)
+            message = build_gave_up_message(fresh_detail, "لا توجد مرحلة نشطة")
+            telegram_manager.broadcast(message, config.wallets)
+            return
+        
+        # ✅ فحص حالة المينت
+        w3 = w3_instances[entry.chain_key]
+        contract_address = fresh_detail.get("contract_address")
+        
+        if not contract_address:
+            return
+        
+        mint_status, start_time, end_time = get_mint_status(w3, contract_address)
+        
+        # ✅ المينت لم يبدأ بعد
+        if mint_status == MintStatus.NOT_STARTED:
+            entry.mint_status = MintStatus.NOT_STARTED
+            entry.mint_start_time = start_time
+            entry.mint_end_time = end_time
+            
+            if entry.waiting_since is None:
+                entry.waiting_since = time.time()
+            
+            # حساب الوقت المتبقي
+            wait_seconds = start_time - int(time.time()) if start_time else 0
+            
+            # إشعار فقط كل 5 دقائق
+            if now - entry.last_notification_time > entry.notification_interval:
+                message = build_waiting_message(fresh_detail, wait_seconds)
+                telegram_manager.broadcast(message, config.wallets)
+                entry.last_notification_time = now
+            
+            log.info(f"⏰ '{slug}' لم يبدأ بعد - متبقي {wait_seconds} ثانية")
+            return
+        
+        # ✅ المينت انتهى
+        if mint_status == MintStatus.ENDED:
+            watchlist.pop(slug, None)
+            message = build_gave_up_message(fresh_detail, "انتهى المينت")
+            telegram_manager.broadcast(message, config.wallets)
+            return
+        
+        # ✅ المينت نشط - استمر في الفحص
+        entry.mint_status = MintStatus.ACTIVE
+        entry.mint_start_time = start_time
+        entry.mint_end_time = end_time
+        
+        # التحقق من نهاية المرحلة
+        if stage_has_ended(stage) and not fresh_detail.get("next_stage"):
             watchlist.pop(slug, None)
             message = build_gave_up_message(fresh_detail, "انتهت المرحلة")
             telegram_manager.broadcast(message, config.wallets)
             return
         
         # فحص السعر الحالي
-        w3 = w3_instances[entry.chain_key]
         eth_price_usd = get_eth_price_usd()
-        contract_address = fresh_detail.get("contract_address")
-        
-        if not contract_address:
-            return
         
         onchain_price = await asyncio.to_thread(
             get_onchain_public_price_wei,
@@ -951,6 +1120,10 @@ async def check_watchlist_entry(slug: str, entry: WatchlistEntry):
                 entry.detail = fresh_detail
                 entry.was_paid = False
                 entry.last_price_usd = price_usd
+            elif any(r.get("reason") == "mint_not_started" for r in results):
+                # المينت لم يبدأ بعد - استمر في الانتظار
+                entry.mint_status = MintStatus.NOT_STARTED
+                entry.waiting_since = time.time()
             elif len(successful_mints.get(slug, set())) >= len(config.wallets):
                 # اكتمل الشراء لجميع المحافظ
                 watchlist.pop(slug, None)
@@ -1101,6 +1274,10 @@ class OpenSeaStream:
         if slug in watchlist:
             rejection_manager.unmark_rejected(slug)
         
+        # إزالة من known_slugs للسماح بإعادة التقييم
+        if slug in known_slugs:
+            known_slugs.discard(slug)
+        
         # إنشاء مهمة للتقييم (بدون انتظار)
         asyncio.create_task(evaluate_new_mint(slug, chain_key))
 
@@ -1152,7 +1329,6 @@ async def run():
             "🔴 البوت شغّال لكن بوضع الإيقاف (BOT_ENABLED=false).",
             config.wallets
         )
-        # انتظار حتى يتم إرسال الرسالة
         await telegram_manager.send_queue.join()
         return
     
