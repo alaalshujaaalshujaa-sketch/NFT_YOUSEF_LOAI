@@ -5,7 +5,7 @@
 - مراقبة المينتات المدفوعة
 - إعادة المحاولة التلقائية
 - تخزين الحالة في قاعدة بيانات
-- حد السعر المجاني 0.0001 دولار
+- حد السعر المجاني 0.01 دولار
 """
 
 import asyncio
@@ -25,8 +25,8 @@ ZERO_ADDRESS = Web3.to_checksum_address("0x0000000000000000000000000000000000000
 # الحد الأقصى لرسوم الغاز (5 سنتات)
 MAX_GAS_FEE_USD = 0.05
 
-# حد السعر المجاني (0.0001 دولار = 0.01 سنت)
-FREE_PRICE_THRESHOLD_USD = 0.0001
+# حد السعر المجاني (0.01 دولار = 1 سنت)
+FREE_PRICE_THRESHOLD_USD = 0.01
 
 # إعدادات الشراء
 MIN_BALANCE_RESERVE_USD = 0.10
@@ -226,7 +226,7 @@ def decide_quantity(max_per_wallet: Optional[int], remaining_supply: int) -> int
 def is_free_or_negligible(price_wei: int, eth_price_usd: float) -> bool:
     """
     التحقق من أن السعر مجاني أو لا يُذكر
-    الحد الأدنى: 0.0001 دولار (0.01 سنت)
+    الحد الأدنى: 0.01 دولار (1 سنت)
     """
     price_usd = (price_wei / 1e18) * eth_price_usd
     return price_usd < FREE_PRICE_THRESHOLD_USD
