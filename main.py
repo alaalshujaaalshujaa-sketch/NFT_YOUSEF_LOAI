@@ -3,6 +3,7 @@
   - يكتشف مينتات اليوم على Robinhood + Ethereum
   - يشتري لجميع المحافظ المعرفة بالتوازي (Parallel Execution)
   - يرسل إشعار الشراء أو التحديث لكل محفظة على بوت التيليجرام الخاص بها
+  - يراقب المينتات المدفوعة التي قد تتحول لمرحلة مجانية
 """
 
 import asyncio
@@ -62,6 +63,10 @@ class WatchlistEntry:
     last_check: float = 0
     check_count: int = 0
     max_checks: int = 100  # حد أقصى للمراقبة
+    twitter_checked: bool = False  # هل تم فحص تويتر مسبقاً
+    twitter_username: Optional[str] = None  # اسم مستخدم تويتر إذا تم فحصه
+    was_paid: bool = False  # هل كان المينت مدفوعاً
+    last_price_usd: float = 0.0  # آخر سعر تم رصده
 
 class Config:
     """إدارة الإعدادات من ملف .env"""
@@ -187,6 +192,10 @@ def get_eth_price_usd() -> float:
         log.warning(f"[السعر] تعذر جلب سعر ETH: {e}")
         return _eth_price_cache["value"] or 3000.0
 
+def calculate_price_usd(price_wei: int, eth_price_usd: float) -> float:
+    """حساب السعر بالدولار من wei"""
+    return (price_wei / 1e18) * eth_price_usd
+
 # ---------------------------------------------------------------------------
 # إدارة التخزين المؤقت للرفض
 # ---------------------------------------------------------------------------
@@ -213,6 +222,10 @@ class RejectionManager:
     def mark_rejected(self, slug: str):
         """وضع علامة رفض لمجموعة"""
         self._rejections[slug] = time.time()
+    
+    def unmark_rejected(self, slug: str):
+        """إزالة علامة الرفض"""
+        self._rejections.pop(slug, None)
     
     def cleanup(self):
         """تنظيف الإدخالات القديمة"""
@@ -386,6 +399,17 @@ def build_watching_message(detail: dict, reason: str) -> str:
         f"سنحاول الشراء تلقائيًا فور توفر الفرصة."
     )
 
+def build_price_drop_message(detail: dict, old_price: float, new_price: float) -> str:
+    """بناء رسالة انخفاض السعر"""
+    name = detail.get("collection_name") or detail.get("collection_slug", "Unknown")
+    return (
+        f"🎉 <b>انخفض السعر!</b>\n\n"
+        f"المجموعة: <b>{name}</b>\n"
+        f"السعر القديم: ${old_price:.4f}\n"
+        f"السعر الجديد: ${new_price:.4f}\n"
+        f"جاري محاولة الشراء..."
+    )
+
 def build_gave_up_message(detail: dict, reason: str) -> str:
     """بناء رسالة إلغاء"""
     name = detail.get("collection_name") or detail.get("collection_slug", "Unknown")
@@ -555,11 +579,36 @@ async def try_buy_now_multi_wallet(
     return processed_results
 
 # ---------------------------------------------------------------------------
+# فحص تويتر مع cache
+# ---------------------------------------------------------------------------
+
+async def check_twitter(slug: str, entry: Optional[WatchlistEntry] = None) -> Tuple[bool, Optional[str]]:
+    """فحص تويتر مع استخدام cache إذا كان متاحاً"""
+    
+    # استخدام cache إذا كان متاحاً
+    if entry and entry.twitter_checked:
+        return bool(entry.twitter_username), entry.twitter_username
+    
+    # فحص جديد
+    twitter_username = await asyncio.to_thread(
+        get_twitter_username_from_opensea,
+        slug,
+        config.opensea_api_key
+    )
+    
+    # تحديث entry إذا كان موجوداً
+    if entry:
+        entry.twitter_checked = True
+        entry.twitter_username = twitter_username
+    
+    return bool(twitter_username), twitter_username
+
+# ---------------------------------------------------------------------------
 # تقييم المينتات الجديدة
 # ---------------------------------------------------------------------------
 
 async def evaluate_new_mint(slug: str, chain_key: str):
-    """تقييم مينت جديد واتخاذ قرار الشراء"""
+    """تقييم مينت جديد واتخاذ قرار الشراء أو المراقبة"""
     
     # التحقق من الحالة
     if (
@@ -587,10 +636,13 @@ async def evaluate_new_mint(slug: str, chain_key: str):
         if not stage or not started_today_local(stage):
             return
         
-        # التحقق من السعر قبل فحص تويتر لتوفير API requests
+        # فحص السعر
         w3 = w3_instances[chain_key]
         eth_price_usd = get_eth_price_usd()
         contract_address = detail.get("contract_address")
+        
+        price_wei = None
+        price_usd = 0.0
         
         if contract_address:
             onchain_price = await asyncio.to_thread(
@@ -599,35 +651,62 @@ async def evaluate_new_mint(slug: str, chain_key: str):
                 contract_address
             )
             price_wei = onchain_price if onchain_price is not None else int(stage.get("price", "0"))
+            price_usd = calculate_price_usd(price_wei, eth_price_usd)
+        
+        # ✅ المينت مجاني - فحص تويتر والشراء
+        if price_wei is None or is_free_or_negligible(price_wei, eth_price_usd):
+            log.info(f"🆓 '{slug}' مجاني (${price_usd:.4f}) - فحص تويتر والشراء")
             
-            if not is_free_or_negligible(price_wei, eth_price_usd):
+            # فحص تويتر
+            has_twitter, twitter_username = await check_twitter(slug)
+            
+            if not has_twitter:
+                log.info(f"⏭️ تجاهل '{slug}': لا يوجد حساب X مربوط.")
+                rejection_manager.mark_rejected(slug)
                 return
+            
+            log.info(f"✅ '{slug}': يوجد حساب X (@{twitter_username}) — جاري الشراء.")
+            
+            # محاولة الشراء
+            results = await try_buy_now_multi_wallet(slug, chain_key, detail)
+            
+            if results is None:
+                await add_to_watchlist(slug, chain_key, detail, "السعر الحالي مدفوع")
+                return
+            
+            if len(successful_mints.get(slug, set())) < len(config.wallets):
+                await add_to_watchlist(slug, chain_key, detail, "لم تكتمل كل المحافظ")
         
-        # فحص تويتر
-        twitter_username = await asyncio.to_thread(
-            get_twitter_username_from_opensea,
-            slug,
-            config.opensea_api_key
-        )
-        
-        if not twitter_username:
-            log.info(f"⏭️ تجاهل '{slug}': لا يوجد حساب X مربوط.")
-            rejection_manager.mark_rejected(slug)
-            return
-        
-        log.info(f"✅ '{slug}': يوجد حساب X (@{twitter_username}) — جاري الشراء.")
-        
-        # محاولة الشراء
-        results = await try_buy_now_multi_wallet(slug, chain_key, detail)
-        
-        if results is None:
-            # إضافة للمراقبة
-            await add_to_watchlist(slug, chain_key, detail, "السعر الحالي مدفوع")
-            return
-        
-        # إذا لم تكتمل كل المحافظ، أضف للمراقبة
-        if len(successful_mints.get(slug, set())) < len(config.wallets):
-            await add_to_watchlist(slug, chain_key, detail, "لم تكتمل كل المحافظ")
+        # ⚠️ المينت مدفوع - قد يصبح مجاني لاحقاً
+        else:
+            log.info(f"💰 '{slug}' مدفوع (${price_usd:.4f}) - إضافة للمراقبة")
+            
+            # فحص تويتر مسبقاً لتوفير الوقت لاحقاً
+            has_twitter, twitter_username = await check_twitter(slug)
+            
+            if has_twitter:
+                # إضافة للمراقبة مع معلومات تويتر
+                entry = WatchlistEntry(
+                    chain_key=chain_key,
+                    detail=detail,
+                    added_at=time.time(),
+                    twitter_checked=True,
+                    twitter_username=twitter_username,
+                    was_paid=True,
+                    last_price_usd=price_usd,
+                )
+                watchlist[slug] = entry
+                
+                # إشعار المراقبة
+                message = build_watching_message(
+                    detail, 
+                    f"مدفوع حالياً (${price_usd:.4f}) - نراقب لاحتمال انخفاض السعر"
+                )
+                telegram_manager.broadcast(message, config.wallets)
+            else:
+                # لا يوجد تويتر - تجاهل نهائي
+                log.info(f"⏭️ تجاهل '{slug}': لا يوجد حساب X مربوط.")
+                rejection_manager.mark_rejected(slug)
     
     except Exception as e:
         log.error(f"خطأ بتقييم '{slug}': {e}", exc_info=True)
@@ -658,7 +737,7 @@ async def add_to_watchlist(slug: str, chain_key: str, detail: dict, reason: str)
 # ---------------------------------------------------------------------------
 
 async def watch_loop():
-    """مراقبة المينتات في قائمة المراقبة"""
+    """مراقبة المينتات في قائمة المراقبة والتحقق من تغير الأسعار"""
     
     while True:
         await asyncio.sleep(config.watch_poll_interval)
@@ -714,22 +793,83 @@ async def watch_loop():
                     telegram_manager.broadcast(message, config.wallets)
                     continue
                 
-                # محاولة الشراء
-                results = await try_buy_now_multi_wallet(
-                    slug,
-                    entry.chain_key,
-                    fresh_detail
+                # فحص السعر الحالي
+                w3 = w3_instances[entry.chain_key]
+                eth_price_usd = get_eth_price_usd()
+                contract_address = fresh_detail.get("contract_address")
+                
+                if not contract_address:
+                    continue
+                
+                onchain_price = await asyncio.to_thread(
+                    get_onchain_public_price_wei,
+                    w3,
+                    contract_address
                 )
                 
-                if results is None:
-                    # تحديث التفاصيل في قائمة المراقبة
-                    entry.detail = fresh_detail
-                elif len(successful_mints.get(slug, set())) >= len(config.wallets):
-                    # اكتمل الشراء لجميع المحافظ
-                    watchlist.pop(slug, None)
+                if onchain_price is None:
+                    continue
+                
+                price_wei = onchain_price
+                price_usd = calculate_price_usd(price_wei, eth_price_usd)
+                
+                # ✅ السعر أصبح مجاني/منخفض!
+                if is_free_or_negligible(price_wei, eth_price_usd):
+                    # إذا كان المينت كان مدفوعاً وأصبح مجانياً
+                    if entry.was_paid and entry.last_price_usd > 0:
+                        log.info(f"🎉 '{slug}' انخفض سعره من ${entry.last_price_usd:.4f} إلى ${price_usd:.4f}!")
+                        
+                        # إشعار بانخفاض السعر
+                        message = build_price_drop_message(
+                            fresh_detail,
+                            entry.last_price_usd,
+                            price_usd
+                        )
+                        telegram_manager.broadcast(message, config.wallets)
+                    
+                    # التحقق من تويتر (باستخدام cache إذا كان متاحاً)
+                    has_twitter, twitter_username = await check_twitter(slug, entry)
+                    
+                    if not has_twitter:
+                        log.info(f"⏭️ '{slug}': لا يوجد حساب X مربوط.")
+                        watchlist.pop(slug, None)
+                        rejection_manager.mark_rejected(slug)
+                        continue
+                    
+                    log.info(f"✅ '{slug}': يوجد حساب X (@{twitter_username}) — جاري الشراء.")
+                    
+                    # محاولة الشراء
+                    results = await try_buy_now_multi_wallet(
+                        slug,
+                        entry.chain_key,
+                        fresh_detail
+                    )
+                    
+                    if results is None:
+                        # لم يكتمل الشراء - تحديث البيانات
+                        entry.detail = fresh_detail
+                        entry.was_paid = False
+                        entry.last_price_usd = price_usd
+                    elif len(successful_mints.get(slug, set())) >= len(config.wallets):
+                        # اكتمل الشراء لجميع المحافظ
+                        watchlist.pop(slug, None)
+                        log.info(f"🎉 اكتمل الشراء لجميع المحافظ في '{slug}'")
+                    else:
+                        # تحديث البيانات
+                        entry.detail = fresh_detail
+                        entry.was_paid = False
+                        entry.last_price_usd = price_usd
+                
+                # ⚠️ المينت لا يزال مدفوعاً
                 else:
-                    # تحديث التفاصيل
+                    # تحديث البيانات
                     entry.detail = fresh_detail
+                    entry.was_paid = True
+                    entry.last_price_usd = price_usd
+                    
+                    # تسجيل التغير في السعر
+                    if entry.check_count % 10 == 0:  # كل 10 فحوصات
+                        log.info(f"💰 '{slug}' لا يزال مدفوعاً (${price_usd:.4f}) - فحص #{entry.check_count}")
             
             except Exception as e:
                 log.error(f"خطأ بدورة مراقبة '{slug}': {e}", exc_info=True)
@@ -856,6 +996,10 @@ class OpenSeaStream:
         if not slug:
             return
         
+        # إذا كان slug في قائمة المراقبة، قم بإلغاء rejection cooldown
+        if slug in watchlist:
+            rejection_manager.unmark_rejected(slug)
+        
         # إنشاء مهمة للتقييم
         asyncio.create_task(evaluate_new_mint(slug, chain_key))
 
@@ -865,7 +1009,7 @@ class OpenSeaStream:
 
 def is_free_or_negligible(price_wei: int, eth_price_usd: float) -> bool:
     """التحقق من أن السعر مجاني أو مهمل"""
-    price_usd = (price_wei / 1e18) * eth_price_usd
+    price_usd = calculate_price_usd(price_wei, eth_price_usd)
     return price_usd < config.free_price_threshold
 
 def parse_iso(ts: str) -> Optional[datetime]:
