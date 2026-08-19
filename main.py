@@ -1,7 +1,7 @@
 """
-🚀 بوت شراء NFT تلقائي - نسخة محسّنة ومستقرة
+🚀 بوت شراء NFT تلقائي - نسخة نهائية مستقرة
 - يدعم 10 محافظ مع بوت تليجرام لكل محفظة
-- اكتشاف سريع للمينتات عبر WebSocket + Mempool
+- اكتشاف سريع للمينتات عبر WebSocket + Mempool + Polling
 - فحص تويتر كشرط أساسي للشراء
 - تخزين مؤقت لتسريع العمليات
 - إعادة محاولة ذكية للتعامل مع الأخطاء
@@ -14,6 +14,7 @@ import logging
 import os
 import time
 from typing import Dict, Set, Optional, List
+from datetime import datetime, timezone
 
 import requests
 import websockets
@@ -93,10 +94,10 @@ ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 FREE_PRICE_THRESHOLD_USD = 0.01
 
 # 🔥 تحسينات WebSocket
-WEBSOCKET_PING_INTERVAL = 25  # زيادة من 20
-WEBSOCKET_PING_TIMEOUT = 15   # زيادة من 5
-WEBSOCKET_OPEN_TIMEOUT = 10
-WEBSOCKET_CLOSE_TIMEOUT = 10
+WEBSOCKET_PING_INTERVAL = 30  # زيادة من 25
+WEBSOCKET_PING_TIMEOUT = 20   # زيادة من 15
+WEBSOCKET_OPEN_TIMEOUT = 15
+WEBSOCKET_CLOSE_TIMEOUT = 15
 
 CHAIN_CONFIGS = {
     "robinhood": {
@@ -135,8 +136,11 @@ send_queue: asyncio.Queue = asyncio.Queue()
 
 # تتبع معدل الطلبات
 _api_request_times = []
-API_RATE_LIMIT = 10  # طلبات لكل
-API_RATE_WINDOW = 2  # ثانيتين
+API_RATE_LIMIT = 10
+API_RATE_WINDOW = 2
+
+# مجموعة slugs التي تم رؤيتها (لـ Polling)
+seen_slugs: Set[str] = set()
 
 # ============================================
 # 🔥 دوال مساعدة مع إعادة محاولة
@@ -179,13 +183,13 @@ async def fetch_drop_detail_with_retry(slug: str, max_retries: int = 3) -> tuple
     
     for attempt in range(max_retries):
         try:
-            await rate_limit()  # 🔥 تطبيق Rate Limiting
+            await rate_limit()
             
             resp = await asyncio.to_thread(
                 requests.get,
                 f"{DROPS_API_BASE}/{slug}",
                 headers={"x-api-key": OPENSEA_API_KEY},
-                timeout=10,  # 🔥 زيادة timeout
+                timeout=10,
             )
             
             if resp.status_code == 200:
@@ -200,10 +204,10 @@ async def fetch_drop_detail_with_retry(slug: str, max_retries: int = 3) -> tuple
         except Exception as e:
             if attempt < max_retries - 1:
                 wait_time = (attempt + 1) * 1.5
-                log.warning(f"[Drops API] محاولة {attempt + 1} فشلت: {e}. إعادة بعد {wait_time}s")
+                log.debug(f"[Drops API] محاولة {attempt + 1} فشلت، إعادة بعد {wait_time}s")
                 await asyncio.sleep(wait_time)
             else:
-                log.warning(f"[Drops API] فشل بعد {max_retries} محاولات: {e}")
+                log.debug(f"[Drops API] فشل بعد {max_retries} محاولات: {e}")
     
     return (False, None)
 
@@ -215,7 +219,7 @@ async def get_slug_from_contract(contract_address: str, chain_key: str) -> Optio
         return cached
     
     try:
-        await rate_limit()  # 🔥 تطبيق Rate Limiting
+        await rate_limit()
         
         url = "https://api.opensea.io/api/v2/collections"
         params = {"asset_contract_address": contract_address, "limit": 1}
@@ -229,8 +233,8 @@ async def get_slug_from_contract(contract_address: str, chain_key: str) -> Optio
                 if slug:
                     mempool_slug_cache.set(cache_key, slug)
                     return slug
-    except Exception as e:
-        log.debug(f"خطأ في جلب slug: {e}")
+    except Exception:
+        pass
     return None
 
 # ============================================
@@ -487,6 +491,7 @@ MINT_PUBLIC_SIGNATURE = "0x8c7a63ae"
 async def listen_mempool(chain_key: str):
     """الاستماع إلى Mempool لاكتشاف أسرع"""
     ws_url = CHAIN_CONFIGS[chain_key]["ws_rpc_url"]
+    reconnect_delay = 2
     
     while True:
         try:
@@ -504,6 +509,7 @@ async def listen_mempool(chain_key: str):
                 }
                 await ws.send(json.dumps(subscribe))
                 log.info(f"✅ بدء Mempool لـ {chain_key}")
+                reconnect_delay = 2
                 
                 while True:
                     try:
@@ -532,18 +538,74 @@ async def listen_mempool(chain_key: str):
                     except json.JSONDecodeError:
                         continue
                     except Exception as e:
-                        log.error(f"خطأ Mempool: {e}")
+                        log.debug(f"خطأ Mempool: {e}")
                         
         except Exception as e:
-            log.warning(f"انقطع Mempool ({e}). إعادة...")
-            await asyncio.sleep(3)
+            log.warning(f"انقطع Mempool ({e}). إعادة بعد {reconnect_delay}s")
+            await asyncio.sleep(reconnect_delay)
+            reconnect_delay = min(reconnect_delay * 2, 30)
 
 # ============================================
-# 🔥 OpenSea Stream - محسّن
+# 🔥 OpenSea Polling - بديل احتياطي
+# ============================================
+
+async def poll_opensea():
+    """جلب المينتات الجديدة عبر API كبديل للـ WebSocket"""
+    global seen_slugs
+    
+    while True:
+        try:
+            url = "https://api.opensea.io/api/v2/collections"
+            params = {
+                "limit": 20,
+                "order_by": "created_date",
+                "order_direction": "desc"
+            }
+            headers = {"x-api-key": OPENSEA_API_KEY}
+            
+            resp = await asyncio.to_thread(
+                requests.get, url, params=params, headers=headers, timeout=10
+            )
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                collections = data.get("collections", [])
+                
+                for collection in collections:
+                    slug = collection.get("slug")
+                    if not slug or slug in seen_slugs:
+                        continue
+                    
+                    # التحقق إذا كانت مجموعة جديدة (منذ آخر دقيقتين)
+                    created_date = collection.get("created_date")
+                    if created_date:
+                        try:
+                            created = datetime.fromisoformat(created_date.replace("Z", "+00:00"))
+                            if (datetime.now(timezone.utc) - created).seconds < 120:
+                                seen_slugs.add(slug)
+                                log.info(f"🔄 Polling: {slug}")
+                                asyncio.create_task(evaluate_new_mint(slug, "ethereum"))
+                        except:
+                            pass
+                
+                # تنظيف القائمة (احتفاظ بآخر 500 فقط)
+                if len(seen_slugs) > 500:
+                    seen_slugs = set(list(seen_slugs)[-250:])
+                    
+        except Exception as e:
+            log.debug(f"خطأ في Polling: {e}")
+        
+        await asyncio.sleep(10)  # كل 10 ثواني
+
+# ============================================
+# 🔥 OpenSea Stream - نسخة محسّنة ومستقرة
 # ============================================
 
 async def listen_opensea():
+    """الاستماع إلى OpenSea Stream مع إعادة اتصال تلقائي"""
     msg_ref = 0
+    reconnect_delay = 2
+    
     while True:
         try:
             async with websockets.connect(
@@ -553,62 +615,80 @@ async def listen_opensea():
                 open_timeout=WEBSOCKET_OPEN_TIMEOUT,
                 close_timeout=WEBSOCKET_CLOSE_TIMEOUT,
                 max_size=2**23,
+                user_agent_header="Mozilla/5.0",
+                extra_headers={
+                    "Origin": "https://opensea.io",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                }
             ) as ws:
                 log.info(f"🚀 متصل بـ OpenSea Stream - {len(WALLETS_DATA)} محافظ")
-                await ws.send(json.dumps([str(msg_ref), str(msg_ref), "collection:*", "phx_join", {}]))
+                reconnect_delay = 2
+                
+                # إرسال طلب الانضمام
+                join_ref = str(msg_ref)
+                await ws.send(json.dumps([join_ref, join_ref, "collection:*", "phx_join", {}]))
                 msg_ref += 1
                 last_heartbeat = time.time()
+                heartbeat_interval = 25
 
                 while True:
-                    # Heartbeat كل 25 ثانية
-                    if time.time() - last_heartbeat > WEBSOCKET_PING_INTERVAL:
-                        try:
-                            await ws.send(json.dumps([None, str(msg_ref), "phoenix", "heartbeat", {}]))
-                            msg_ref += 1
-                            last_heartbeat = time.time()
-                        except Exception as e:
-                            log.warning(f"خطأ في heartbeat: {e}")
-                            break
+                    try:
+                        # إرسال heartbeat إذا لزم الأمر
+                        if time.time() - last_heartbeat > heartbeat_interval:
+                            try:
+                                hb_ref = str(msg_ref)
+                                await ws.send(json.dumps([None, hb_ref, "phoenix", "heartbeat", {}]))
+                                msg_ref += 1
+                                last_heartbeat = time.time()
+                            except Exception:
+                                break
 
-                    try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=30)
-                    except asyncio.TimeoutError:
-                        log.debug("WebSocket timeout, إرسال heartbeat...")
-                        continue
-                    
-                    try:
-                        parsed = json.loads(raw)
-                        if not (isinstance(parsed, list) and len(parsed) == 5):
+                        # استقبال الرسائل
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=35)
+                        except asyncio.TimeoutError:
                             continue
                         
-                        _, _, _, event_name, payload_wrapper = parsed
-                        if event_name != "item_transferred":
-                            continue
-                        
-                        payload = payload_wrapper.get("payload", {})
-                        item = payload.get("item", {})
-                        chain_name = item.get("chain", {}).get("name", "")
-                        chain_key = STREAM_NAME_TO_CHAIN_KEY.get(chain_name)
-                        
-                        if not chain_key:
-                            continue
-                        
-                        from_addr = payload.get("from_account", {}).get("address", "").lower()
-                        if from_addr != ZERO_ADDRESS:
-                            continue
-                        
-                        slug = payload.get("collection", {}).get("slug", "")
-                        if slug:
-                            asyncio.create_task(evaluate_new_mint(slug, chain_key))
+                        # معالجة الرسالة
+                        try:
+                            parsed = json.loads(raw)
+                            if not (isinstance(parsed, list) and len(parsed) == 5):
+                                continue
                             
-                    except json.JSONDecodeError:
-                        continue
-                    except Exception as e:
-                        log.error(f"خطأ Stream: {e}")
+                            _, _, _, event_name, payload_wrapper = parsed
+                            if event_name != "item_transferred":
+                                continue
+                            
+                            payload = payload_wrapper.get("payload", {})
+                            item = payload.get("item", {})
+                            chain_name = item.get("chain", {}).get("name", "")
+                            chain_key = STREAM_NAME_TO_CHAIN_KEY.get(chain_name)
+                            
+                            if not chain_key:
+                                continue
+                            
+                            from_addr = payload.get("from_account", {}).get("address", "").lower()
+                            if from_addr != ZERO_ADDRESS:
+                                continue
+                            
+                            slug = payload.get("collection", {}).get("slug", "")
+                            if slug:
+                                asyncio.create_task(evaluate_new_mint(slug, chain_key))
+                                
+                        except json.JSONDecodeError:
+                            continue
+                        except Exception:
+                            continue
+
+                    except websockets.ConnectionClosed:
+                        break
+                    except Exception:
+                        break
 
         except Exception as e:
-            log.warning(f"انقطع Stream ({e}). إعادة بعد 3 ثواني...")
-            await asyncio.sleep(3)
+            log.warning(f"انقطع Stream. إعادة بعد {reconnect_delay}s")
+            await asyncio.sleep(reconnect_delay)
+            reconnect_delay = min(reconnect_delay * 2, 30)
 
 # ============================================
 # 🔥 تشغيل البوت
@@ -624,7 +704,8 @@ async def run():
     broadcast_message("✅ تم تشغيل البوت بنجاح!")
     
     tasks = [
-        listen_opensea(),
+        listen_opensea(),      # المصدر الرئيسي
+        poll_opensea(),        # 🔥 بديل احتياطي
         watch_loop(),
         telegram_sender(),
     ]
