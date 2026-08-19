@@ -1,10 +1,11 @@
 """
-النظام الكامل — سرعة قصوى + فحص الأهلية (Allowlist):
+النظام الكامل — سرعة قصوى + فحص الأهلية + تسجيل محسن:
   - استخدام بيانات WebSocket مباشرة
   - قراءة blockchain واحدة
   - فحص مسبق للمينتات القادمة
-  - فحص الأهلية قبل الشراء
+  - فحص الأهلية (Allowlist)
   - شراء فوري عند التفعيل
+  - تسجيل مفصل للأحداث
   - إشعارات بسيطة
 """
 
@@ -52,7 +53,7 @@ class WalletConfig:
     bot_token: str
     chat_id: str
     chain_key: str = ""
-    is_eligible: bool = False  # ✅ نتيجة فحص الأهلية
+    is_eligible: bool = False
 
 @dataclass
 class PendingMint:
@@ -65,7 +66,7 @@ class PendingMint:
     collection_name: str
     opensea_url: str
     price_wei: int
-    eligible_wallets: List[WalletConfig]  # ✅ المحافظ المؤهلة فقط
+    eligible_wallets: List[WalletConfig]
     added_at: float
 
 class Config:
@@ -97,7 +98,6 @@ class Config:
         self.recv_timeout = int(self._get_env("RECV_TIMEOUT", "5"))
         self.free_price_threshold = float(self._get_env("FREE_PRICE_THRESHOLD", "0.01"))
         self.notify_before_start = 43200  # 12 ساعة
-        self.check_allowlist = True  # ✅ تفعيل فحص الأهلية
         
     def _get_env(self, key: str, default: str = "", required: bool = False) -> str:
         value = os.environ.get(key, default).strip()
@@ -148,7 +148,7 @@ in_flight: Set[str] = set()
 
 _eth_price_cache = {"value": None, "ts": 0, "ttl": 300}
 _twitter_cache: Dict[str, Tuple[float, Optional[str]]] = {}
-_allowlist_cache: Dict[str, Dict[str, bool]] = {}  # ✅ cache لفحص الأهلية
+_allowlist_cache: Dict[str, bool] = {}
 
 # ---------------------------------------------------------------------------
 # دوال مساعدة
@@ -189,59 +189,52 @@ def format_time(wait_seconds: int) -> str:
         return f"{secs} ثانية"
 
 # ---------------------------------------------------------------------------
-# ✅ فحص الأهلية (Allowlist)
+# ✅ فحص الأهلية
 # ---------------------------------------------------------------------------
 
 def get_cached_contract(w3: Web3, address: str):
     """الحصول على عقد SeaDrop مع cache"""
-    cache_key = f"{w3.provider.endpoint_uri}:{address}"
-    
     if not hasattr(get_cached_contract, "_cache"):
         get_cached_contract._cache = {}
     
-    if cache_key not in get_cached_contract._cache:
-        get_cached_contract._cache[cache_key] = w3.eth.contract(
+    if address not in get_cached_contract._cache:
+        get_cached_contract._cache[address] = w3.eth.contract(
             address=Web3.to_checksum_address(SEADROP_ADDRESS),
             abi=SEADROP_ABI,
         )
     
-    return get_cached_contract._cache[cache_key]
+    return get_cached_contract._cache[address]
 
 def check_allowlist_for_wallet(
     w3: Web3,
     contract_address: str,
     wallet_address: str,
 ) -> bool:
-    """✅ فحص إذا كانت المحفظة في allowlist"""
+    """فحص إذا كانت المحفظة في allowlist"""
     
     cache_key = f"{contract_address}:{wallet_address.lower()}"
     
-    # استخدام cache
     if cache_key in _allowlist_cache:
         return _allowlist_cache[cache_key]
     
     try:
-        # محاولة قراءة merkle proof للـ allowlist
-        # SeaDrop v1.1+ يدعم فحص الأهلية
         seadrop = get_cached_contract(w3, contract_address)
         
-        # فحص إذا كان هناك allowlist
+        # محاولة فحص merkle root
         try:
-            # SeaDrop v1.2+ method
-            allowlist_data = seadrop.functions.getAllowListMerkleRoot(
+            merkle_root = seadrop.functions.getAllowListMerkleRoot(
                 Web3.to_checksum_address(contract_address)
             ).call()
             
-            if allowlist_data == "0x0000000000000000000000000000000000000000000000000000000000000000":
+            if merkle_root == "0x" + "0" * 64:
                 # لا يوجد allowlist - الجميع مؤهل
                 _allowlist_cache[cache_key] = True
                 return True
         except:
             pass
         
-        # فحص إضافي - هل المحفظة مؤهلة
+        # محاولة فحص مباشر
         try:
-            # بعض العقود تستخدم allowedMinters
             is_allowed = seadrop.functions.isAllowed(
                 Web3.to_checksum_address(contract_address),
                 Web3.to_checksum_address(wallet_address),
@@ -252,20 +245,20 @@ def check_allowlist_for_wallet(
         except:
             pass
         
-        # إذا لم نستطع الفحص - افترض أن الجميع مؤهل
+        # لا يمكن الفحص - افترض مؤهل
         _allowlist_cache[cache_key] = True
         return True
         
     except Exception as e:
-        log.warning(f"[Allowlist] فشل الفحص: {e}")
-        _allowlist_cache[cache_key] = True  # افترض مؤهل
+        log.warning(f"[Allowlist] فشل: {e}")
+        _allowlist_cache[cache_key] = True
         return True
 
 async def check_allowlist_for_all_wallets(
     chain_key: str,
     contract_address: str,
 ) -> List[WalletConfig]:
-    """✅ فحص الأهلية لجميع المحافظ"""
+    """فحص الأهلية لجميع المحافظ"""
     
     w3 = w3_instances[chain_key]
     
@@ -292,7 +285,6 @@ async def check_allowlist_for_all_wallets(
                 ineligible.append(wallet)
                 
         except Exception as e:
-            log.warning(f"[Allowlist] {wallet.wallet[:8]}: {e}")
             wallet.is_eligible = False
             ineligible.append(wallet)
     
@@ -368,9 +360,6 @@ def build_success_message(wallet_short: str, collection_name: str, opensea_url: 
         msg += f"\n\n🔗 <a href='{opensea_url}'>OpenSea</a>"
     return msg
 
-def build_not_eligible_message(collection_name: str) -> str:
-    return f"⚠️ <b>غير مؤهل</b>\n\nالمجموعة: <b>{collection_name}</b>\nمحفظتك ليست في allowlist"
-
 # ---------------------------------------------------------------------------
 # شراء
 # ---------------------------------------------------------------------------
@@ -398,7 +387,10 @@ async def buy_immediately(
     ]
     
     if not pending_wallets:
+        log.info(f"⚠️ '{slug}' لا توجد محافظ للشراء")
         return
+    
+    log.info(f"🛒 '{slug}' شراء {len(pending_wallets)} محافظ...")
     
     tasks = []
     for wallet in pending_wallets:
@@ -439,9 +431,13 @@ async def buy_immediately(
                             result.get("quantity", 0),
                         )
                         telegram_manager.enqueue(w.bot_token, w.chat_id, message)
+                        log.info(f"✅ شراء ناجح: {wallet_short}")
+                    else:
+                        log.warning(f"❌ فشل شراء {w.wallet[:8]}: {result.get('reason', 'unknown')}")
                     
                     return result
                 except Exception as e:
+                    log.error(f"❌ خطأ شراء {w.wallet[:8]}: {e}")
                     return {"success": False, "reason": "exception", "error": str(e)}
                 finally:
                     lock_manager.release_lock(w.wallet)
@@ -449,6 +445,10 @@ async def buy_immediately(
         tasks.append(buy_one())
     
     results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    success_count = sum(1 for r in results if isinstance(r, dict) and r.get("success"))
+    log.info(f"📊 '{slug}' نتيجة الشراء: {success_count}/{len(results)} نجح")
+    
     return results
 
 # ---------------------------------------------------------------------------
@@ -485,6 +485,8 @@ async def process_new_mint_fast(slug: str, chain_key: str, payload: dict):
     processed_slugs.add(slug)
     
     try:
+        log.info(f"🔍 معالجة '{slug}'...")
+        
         collection = payload.get("collection", {}) or {}
         item = payload.get("item", {}) or {}
         
@@ -498,20 +500,25 @@ async def process_new_mint_fast(slug: str, chain_key: str, payload: dict):
         opensea_url = collection.get("opensea_url") or f"https://opensea.io/collection/{slug}"
         
         if not contract_address:
+            log.warning(f"⚠️ '{slug}' لا يوجد عنوان عقد")
             return
+        
+        log.info(f"📦 '{slug}' العقد: {contract_address[:10]}...")
         
         w3 = w3_instances[chain_key]
         
-        # ✅ قراءة واحدة من blockchain
+        # قراءة blockchain
         try:
             public_drop = await asyncio.wait_for(
                 asyncio.to_thread(get_full_drop_info, w3, contract_address),
                 timeout=5,
             )
-        except:
+        except Exception as e:
+            log.error(f"❌ '{slug}' فشل قراءة blockchain: {e}")
             return
         
         if not public_drop:
+            log.warning(f"⚠️ '{slug}' لا توجد بيانات")
             return
         
         price_wei = public_drop[0]
@@ -520,15 +527,19 @@ async def process_new_mint_fast(slug: str, chain_key: str, payload: dict):
         
         current_time = int(time.time())
         eth_price_usd = get_eth_price_usd()
+        price_usd = calculate_price_usd(price_wei, eth_price_usd)
         
-        # ✅ المينت لم يبدأ
+        log.info(f"💰 '{slug}' السعر: ${price_usd:.4f}")
+        
+        # المينت لم يبدأ
         if start_time and current_time < start_time:
             wait_seconds = start_time - current_time
             
-            if wait_seconds > config.notify_before_start:
-                return
+            log.info(f"⏰ '{slug}' يبدأ خلال {wait_seconds} ثانية")
             
-            log.info(f"🔔 '{slug}' سيبدأ خلال {wait_seconds} ثانية")
+            if wait_seconds > config.notify_before_start:
+                log.info(f"⏭️ '{slug}' بعد أكثر من 12 ساعة - تجاهل")
+                return
             
             # فحص تويتر
             has_twitter, twitter_username = await check_twitter_fast(slug)
@@ -537,7 +548,9 @@ async def process_new_mint_fast(slug: str, chain_key: str, payload: dict):
                 log.info(f"⏭️ '{slug}' لا يوجد X")
                 return
             
-            # ✅ فحص الأهلية لجميع المحافظ
+            log.info(f"✅ '{slug}' لديه X")
+            
+            # فحص الأهلية
             log.info(f"🔍 '{slug}' فحص الأهلية...")
             eligible_wallets = await check_allowlist_for_all_wallets(chain_key, contract_address)
             
@@ -545,7 +558,7 @@ async def process_new_mint_fast(slug: str, chain_key: str, payload: dict):
                 log.info(f"❌ '{slug}' لا توجد محافظ مؤهلة")
                 return
             
-            # حفظ للمراقبة
+            # حفظ
             pending_mints[slug] = PendingMint(
                 slug=slug,
                 chain_key=chain_key,
@@ -568,17 +581,22 @@ async def process_new_mint_fast(slug: str, chain_key: str, payload: dict):
                 len(eligible_wallets),
             )
             telegram_manager.broadcast(message, config.wallets)
+            log.info(f"🔔 '{slug}' تم إرسال إشعار")
             return
         
         # المينت انتهى
         if end_time and current_time > end_time:
+            log.info(f"⏰ '{slug}' انتهى")
             return
         
-        # ✅ المينت نشط - فحص السعر
+        # المينت نشط
+        log.info(f"✅ '{slug}' نشط")
+        
         if not is_free_or_negligible(price_wei, eth_price_usd):
+            log.info(f"💰 '{slug}' مدفوع - تجاهل")
             return
         
-        log.info(f"🆓 '{slug}' مجاني - فحص")
+        log.info(f"🆓 '{slug}' مجاني!")
         
         # فحص تويتر
         has_twitter, twitter_username = await check_twitter_fast(slug)
@@ -587,7 +605,9 @@ async def process_new_mint_fast(slug: str, chain_key: str, payload: dict):
             log.info(f"⏭️ '{slug}' لا يوجد X")
             return
         
-        # ✅ فحص الأهلية
+        log.info(f"✅ '{slug}' لديه X")
+        
+        # فحص الأهلية
         log.info(f"🔍 '{slug}' فحص الأهلية...")
         eligible_wallets = await check_allowlist_for_all_wallets(chain_key, contract_address)
         
@@ -595,7 +615,7 @@ async def process_new_mint_fast(slug: str, chain_key: str, payload: dict):
             log.info(f"❌ '{slug}' لا توجد محافظ مؤهلة")
             return
         
-        log.info(f"✅ '{slug}' شراء ({len(eligible_wallets)} محافظ مؤهلة)")
+        log.info(f"✅ '{slug}' شراء {len(eligible_wallets)} محافظ")
         
         await buy_immediately(
             slug=slug,
@@ -608,7 +628,7 @@ async def process_new_mint_fast(slug: str, chain_key: str, payload: dict):
         )
     
     except Exception as e:
-        log.error(f"خطأ '{slug}': {e}")
+        log.error(f"❌ خطأ '{slug}': {e}")
     finally:
         in_flight.discard(slug)
 
@@ -651,7 +671,6 @@ async def watch_loop():
         log.info(f"🎉 '{next_slug}' بدأ! - شراء")
         
         try:
-            # جلب السعر الحالي
             w3 = w3_instances[next_mint.chain_key]
             public_drop = await asyncio.wait_for(
                 asyncio.to_thread(get_full_drop_info, w3, next_mint.contract_address),
@@ -673,7 +692,7 @@ async def watch_loop():
                         eligible_wallets=next_mint.eligible_wallets,
                     )
         except Exception as e:
-            log.error(f"خطأ شراء '{next_slug}': {e}")
+            log.error(f"❌ خطأ شراء '{next_slug}': {e}")
         finally:
             pending_mints.pop(next_slug, None)
 
@@ -688,46 +707,54 @@ class OpenSeaStream:
         self.backoff = 1
         self.max_backoff = 60
         self.last_message_time = time.time()
+        self.message_count = 0
     
     async def listen(self):
         while True:
             try:
                 async with websockets.connect(self.url, ping_interval=None, open_timeout=10) as ws:
-                    log.info("متصل بـ OpenSea Stream")
+                    log.info("✅ متصل بـ OpenSea Stream")
                     
                     self.backoff = 1
                     self.last_message_time = time.time()
+                    self.message_count = 0
                     
+                    # الانضمام
                     join_ref = str(self.msg_ref)
                     await ws.send(json.dumps([join_ref, join_ref, "collection:*", "phx_join", {}]))
                     self.msg_ref += 1
+                    log.info("📡 تم إرسال طلب الانضمام")
                     
                     last_heartbeat = time.time()
                     
                     while True:
+                        # Heartbeat
                         if time.time() - last_heartbeat > config.heartbeat_interval:
                             hb_ref = str(self.msg_ref)
                             await ws.send(json.dumps([None, hb_ref, "phoenix", "heartbeat", {}]))
                             self.msg_ref += 1
                             last_heartbeat = time.time()
                         
+                        # فحص صحة
                         if time.time() - self.last_message_time > 120:
-                            log.warning("لا رسائل - إعادة اتصال")
+                            log.warning(f"⚠️ لا رسائل منذ 120 ثانية")
                             break
                         
                         try:
                             raw = await asyncio.wait_for(ws.recv(), timeout=config.recv_timeout)
                             self.last_message_time = time.time()
+                            self.message_count += 1
                         except asyncio.TimeoutError:
                             continue
                         
                         asyncio.create_task(self._process_message_fast(raw))
             
-            except (websockets.ConnectionClosed, OSError, asyncio.TimeoutError):
+            except (websockets.ConnectionClosed, OSError, asyncio.TimeoutError) as e:
+                log.warning(f"⚠️ انقطع الاتصال: {e}")
                 await asyncio.sleep(self.backoff)
                 self.backoff = min(self.backoff * 2, self.max_backoff)
             except Exception as e:
-                log.error(f"خطأ: {e}")
+                log.error(f"❌ خطأ: {e}")
                 await asyncio.sleep(3)
     
     async def _process_message_fast(self, raw: str):
@@ -741,6 +768,11 @@ class OpenSeaStream:
         
         _, _, _, event_name, payload_wrapper = parsed
         
+        # تسجيل الأحداث المهمة
+        if event_name == "phx_reply":
+            log.info("✅ تم تأكيد الانضمام!")
+            return
+        
         if event_name != "item_transferred":
             return
         
@@ -753,12 +785,17 @@ class OpenSeaStream:
             return
         
         from_address = ((payload.get("from_account") or {}).get("address", "") or "").lower()
-        if from_address != ZERO_ADDRESS:
+        
+        if from_address == ZERO_ADDRESS:
+            log.info(f"✅ MINT جديد!")
+        else:
             return
         
         slug = (payload.get("collection", {}) or {}).get("slug", "")
         if not slug:
             return
+        
+        log.info(f"🎯 المجموعة: {slug}")
         
         asyncio.create_task(process_new_mint_fast(slug, chain_key, payload))
 
@@ -767,12 +804,12 @@ class OpenSeaStream:
 # ---------------------------------------------------------------------------
 
 async def run():
-    log.info(f"بدء التشغيل مع {len(config.wallets)} محافظ")
+    log.info(f"🚀 بدء التشغيل مع {len(config.wallets)} محافظ")
     
     await telegram_manager.start()
     
     if not config.bot_enabled:
-        log.warning("BOT_ENABLED=false")
+        log.warning("🔴 BOT_ENABLED=false")
         telegram_manager.broadcast("🔴 BOT_ENABLED=false", config.wallets)
         await telegram_manager.send_queue.join()
         return
