@@ -67,28 +67,18 @@ def stage_has_ended(stage: dict) -> bool:
     return datetime.now(timezone.utc) > end
 
 # ============================================
-# 🔥 تقييد الطلبات (Rate Limiter)
+# 🔥 إعادة محاولة مع تأخير
 # ============================================
 
-class RateLimiter:
-    """تقييد عدد الطلبات"""
-    
-    def __init__(self, max_requests: int, time_window: float):
-        self.max_requests = max_requests
-        self.time_window = time_window
-        self.requests = []
-    
-    async def wait(self):
-        """انتظار إذا تم تجاوز الحد"""
-        now = time.time()
-        # إزالة الطلبات القديمة
-        self.requests = [ts for ts in self.requests if now - ts < self.time_window]
-        
-        if len(self.requests) >= self.max_requests:
-            # انتظار حتى يصبح هناك مجال
-            oldest = self.requests[0]
-            wait_time = self.time_window - (now - oldest)
-            if wait_time > 0:
-                await asyncio.sleep(wait_time + 0.1)
-        
-        self.requests.append(now)
+async def retry_async(func, *args, max_retries=3, delay=1, **kwargs):
+    """تنفيذ دالة غير متزامنة مع إعادة محاولة"""
+    for attempt in range(max_retries):
+        try:
+            return await func(*args, **kwargs)
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise
+            wait_time = delay * (attempt + 1)
+            log.debug(f"إعادة محاولة {attempt + 1}/{max_retries} بعد {wait_time}s")
+            await asyncio.sleep(wait_time)
+    return None
