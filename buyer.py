@@ -6,10 +6,22 @@
 import asyncio
 import logging
 import time
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, Any
 
 from web3 import Web3
-from web3.middleware import geth_poa_middleware
+
+# محاولة استيراد geth_poa_middleware من المواقع المختلفة
+try:
+    from web3.middleware import geth_poa_middleware
+except ImportError:
+    try:
+        from web3.geth import geth_poa_middleware
+    except ImportError:
+        try:
+            from web3.middleware.geth_poa import geth_poa_middleware
+        except ImportError:
+            geth_poa_middleware = None
+            print("⚠️ geth_poa_middleware غير متوفر - سيتم تشغيل بدون POA middleware")
 
 log = logging.getLogger("buyer-fast")
 
@@ -65,7 +77,7 @@ GAS_LIMIT_SAFETY_MARGIN = 1.2
 GAS_PRIORITY_INCREASE = 10**9  # 1 Gwei زيادة
 
 # ============ Caches ============
-_contract_cache: Dict[str, Tuple[Web3.eth.Contract, float]] = {}
+_contract_cache: Dict[str, Tuple[Any, float]] = {}
 _gas_price_cache: Dict[str, Any] = {"price": None, "ts": 0}
 _nonce_cache: Dict[str, Tuple[int, int]] = {}
 _nonce_cache_lock = asyncio.Lock()
@@ -81,11 +93,14 @@ def get_web3(rpc_url: str) -> Web3:
         rpc_url,
         request_kwargs={'timeout': 5}
     ))
-    # إضافة middleware لتسريع المعاملات
-    try:
-        w3.middleware_onion.inject(geth_poa_middleware, layer=0)
-    except Exception:
-        pass
+    
+    # إضافة middleware لتسريع المعاملات (إذا كان متوفراً)
+    if geth_poa_middleware is not None:
+        try:
+            w3.middleware_onion.inject(geth_poa_middleware, layer=0)
+        except Exception:
+            pass
+    
     return w3
 
 def get_wallet_lock(wallet_address: str) -> asyncio.Lock:
@@ -96,7 +111,7 @@ def get_wallet_lock(wallet_address: str) -> asyncio.Lock:
     return wallet_locks[addr]
 
 # ============ Cached Contract ============
-def get_cached_contract(w3: Web3, address: str, abi: list) -> Web3.eth.Contract:
+def get_cached_contract(w3: Web3, address: str, abi: list) -> Any:
     """الحصول على نسخة العقد من cache"""
     key = f"{address}_{id(w3)}"
     now = time.time()
@@ -275,7 +290,7 @@ def attempt_purchase_single_wallet(
         # 5. بناء المعاملة
         contract = get_cached_contract(w3, SEADROP_ADDRESS, SEADROP_ABI)
         
-        # الحصول على nonce من cache
+        # الحصول على nonce
         nonce = w3.eth.get_transaction_count(checksum_wallet, "pending")
         
         # بناء المعاملة مع إعدادات السرعة
@@ -289,7 +304,6 @@ def attempt_purchase_single_wallet(
             "value": total_value,
             "nonce": nonce,
             "chainId": w3.eth.chain_id,
-            "type": 2,  # EIP-1559
         })
 
         # 6. تقدير الغاز مع margin
@@ -311,9 +325,15 @@ def attempt_purchase_single_wallet(
         if wallet_balance_wei < total_cost_wei:
             return {"success": False, "wallet": checksum_wallet, "reason": "insufficient_funds_for_total_cost"}
 
-        # 9. إضافة أولوية للغاز لتسريع المعاملة
-        tx["maxPriorityFeePerGas"] = gas_price + GAS_PRIORITY_INCREASE
-        tx["maxFeePerGas"] = gas_price * 2
+        # 9. إضافة أولوية للغاز لتسريع المعاملة (للشبكات التي تدعم EIP-1559)
+        try:
+            # محاولة استخدام EIP-1559
+            tx["maxPriorityFeePerGas"] = gas_price + GAS_PRIORITY_INCREASE
+            tx["maxFeePerGas"] = gas_price * 2
+            tx["type"] = 2
+        except Exception:
+            # إذا لم تدعم الشبكة EIP-1559، استخدم الطريقة القديمة
+            tx["gasPrice"] = gas_price
 
         # 10. توقيع وإرسال المعاملة
         signed = w3.eth.account.sign_transaction(tx, private_key=private_key)
