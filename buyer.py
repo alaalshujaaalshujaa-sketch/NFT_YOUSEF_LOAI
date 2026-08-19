@@ -1,10 +1,9 @@
 """
-محرك الشراء التلقائي المتعدد المحافظ
+محرك الشراء التلقائي المتعدد المحافظ عبر عقد SeaDrop.
 """
 
 import asyncio
 import logging
-import time
 from web3 import Web3
 
 log = logging.getLogger("buyer")
@@ -57,6 +56,7 @@ FEW_THRESHOLD = 20
 LIMITED_BUY_QTY = 15
 GAS_LIMIT_SAFETY_MARGIN = 1.2
 
+# قفل خاص لكل محفظة لمنع تضارب المعاملات والنونس في نفس الوقت
 wallet_locks = {}
 
 def get_wallet_lock(wallet_address: str) -> asyncio.Lock:
@@ -65,8 +65,10 @@ def get_wallet_lock(wallet_address: str) -> asyncio.Lock:
         wallet_locks[addr] = asyncio.Lock()
     return wallet_locks[addr]
 
+
 def get_web3(rpc_url: str) -> Web3:
     return Web3(Web3.HTTPProvider(rpc_url))
+
 
 def get_wallet_balance_usd(w3: Web3, wallet_address: str, eth_price_usd: float) -> float:
     try:
@@ -74,8 +76,9 @@ def get_wallet_balance_usd(w3: Web3, wallet_address: str, eth_price_usd: float) 
         balance_wei = w3.eth.get_balance(checksum_wallet)
         return (balance_wei / 1e18) * eth_price_usd
     except Exception as e:
-        log.error(f"[الرصيد] خطأ للمحفظة {wallet_address[:8]}: {e}")
+        log.error(f"[الرصيد] تعذر القراءة للمحفظة {wallet_address[:8]}...: {e}")
         return 0.0
+
 
 def estimate_gas_fee_usd(w3: Web3, eth_price_usd: float, gas_units: int = 150_000) -> float:
     try:
@@ -83,8 +86,9 @@ def estimate_gas_fee_usd(w3: Web3, eth_price_usd: float, gas_units: int = 150_00
         fee_eth = (gas_price_wei * gas_units) / 1e18
         return fee_eth * eth_price_usd
     except Exception as e:
-        log.warning(f"[الغاز] خطأ: {e}")
+        log.warning(f"[الغاز] تعذر التقدير: {e}")
         return float("inf")
+
 
 def get_fee_recipient(w3: Web3, nft_contract: str) -> str | None:
     try:
@@ -96,13 +100,11 @@ def get_fee_recipient(w3: Web3, nft_contract: str) -> str | None:
             return None
         return Web3.to_checksum_address(recipients[0])
     except Exception as e:
-        log.error(f"[عنوان الرسوم] خطأ: {e}")
+        log.error(f"[عنوان الرسوم] خطأ استعلام: {e}")
         return None
 
+
 def decide_quantity(max_per_wallet: int | None, remaining_supply: int) -> int:
-    if remaining_supply <= 0:
-        return 0
-    
     if max_per_wallet is None:
         qty = 5
     elif max_per_wallet <= FEW_THRESHOLD:
@@ -111,28 +113,18 @@ def decide_quantity(max_per_wallet: int | None, remaining_supply: int) -> int:
         qty = LIMITED_BUY_QTY
     return max(1, min(qty, remaining_supply))
 
-# تخزين مؤقت للسعر
-_price_cache = {}
 
 def get_onchain_public_price_wei(w3: Web3, nft_contract: str) -> int | None:
-    contract_key = nft_contract.lower()
-    
-    if contract_key in _price_cache:
-        cached_price, timestamp = _price_cache[contract_key]
-        if time.time() - timestamp < 5:
-            return cached_price
-    
     try:
         seadrop = w3.eth.contract(address=SEADROP_ADDRESS, abi=SEADROP_ABI)
         public_drop = seadrop.functions.getPublicDrop(
             Web3.to_checksum_address(nft_contract)
         ).call()
-        price = int(public_drop[0])
-        _price_cache[contract_key] = (price, time.time())
-        return price
+        return int(public_drop[0])
     except Exception as e:
-        log.warning(f"[سعر on-chain] خطأ: {e}")
+        log.warning(f"[سعر on-chain] تعذر القراءة: {e}")
         return None
+
 
 def attempt_purchase_single_wallet(
     w3: Web3,
@@ -145,8 +137,7 @@ def attempt_purchase_single_wallet(
     eth_price_usd: float,
     max_gas_fee_usd: float,
 ) -> dict:
-    """محاولة الشراء من محفظة واحدة"""
-    
+    """محاولة الشراء بمحفظة واحدة محددة"""
     try:
         checksum_wallet = Web3.to_checksum_address(wallet_address)
         checksum_contract = Web3.to_checksum_address(nft_contract)
@@ -155,20 +146,17 @@ def attempt_purchase_single_wallet(
 
     balance_usd = get_wallet_balance_usd(w3, checksum_wallet, eth_price_usd)
     if balance_usd < MIN_BALANCE_RESERVE_USD:
-        return {"success": False, "wallet": checksum_wallet, "reason": "balance_too_low"}
+        return {"success": False, "wallet": checksum_wallet, "reason": "balance_too_low", "balance_usd": balance_usd}
 
     gas_fee_usd = estimate_gas_fee_usd(w3, eth_price_usd)
     if gas_fee_usd > max_gas_fee_usd:
-        return {"success": False, "wallet": checksum_wallet, "reason": "gas_too_high"}
+        return {"success": False, "wallet": checksum_wallet, "reason": "gas_too_high", "gas_fee_usd": gas_fee_usd}
 
     fee_recipient = get_fee_recipient(w3, checksum_contract)
     if not fee_recipient:
         return {"success": False, "wallet": checksum_wallet, "reason": "no_fee_recipient"}
 
     quantity = decide_quantity(max_per_wallet, remaining_supply)
-    if quantity <= 0:
-        return {"success": False, "wallet": checksum_wallet, "reason": "no_quantity"}
-
     total_value = price_wei_per_token * quantity
 
     try:
@@ -191,29 +179,31 @@ def attempt_purchase_single_wallet(
             estimated_gas = w3.eth.estimate_gas(tx)
             tx["gas"] = int(estimated_gas * GAS_LIMIT_SAFETY_MARGIN)
         except Exception as e:
-            return {"success": False, "wallet": checksum_wallet, "reason": "simulation_failed"}
+            return {"success": False, "wallet": checksum_wallet, "reason": "simulation_failed", "error": str(e)}
 
         actual_gas_fee_usd = (tx["gas"] * w3.eth.gas_price / 1e18) * eth_price_usd
         if actual_gas_fee_usd > max_gas_fee_usd:
-            return {"success": False, "wallet": checksum_wallet, "reason": "gas_too_high"}
+            return {"success": False, "wallet": checksum_wallet, "reason": "gas_too_high", "gas_fee_usd": actual_gas_fee_usd}
 
         total_cost_wei = total_value + (tx["gas"] * w3.eth.gas_price)
         wallet_balance_wei = w3.eth.get_balance(checksum_wallet)
         if wallet_balance_wei < total_cost_wei:
-            return {"success": False, "wallet": checksum_wallet, "reason": "insufficient_funds"}
+            return {"success": False, "wallet": checksum_wallet, "reason": "insufficient_funds_for_total_cost"}
 
         signed = w3.eth.account.sign_transaction(tx, private_key=private_key)
         tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
 
-        log.info(f"[شراء ناجح] {checksum_wallet[:8]} → {tx_hash.hex()[:16]}... كمية: {quantity}")
+        log.info(f"[شراء ناجح - {checksum_wallet[:8]}] {tx_hash.hex()} — كمية: {quantity}")
         return {
             "success": True,
             "wallet": checksum_wallet,
             "tx_hash": tx_hash.hex(),
             "quantity": quantity,
             "gas_fee_usd": actual_gas_fee_usd,
+            "total_value_wei": total_value,
         }
 
     except Exception as e:
-        log.error(f"[خطأ] {checksum_wallet[:8]}: {e}")
+        log.error(f"[خطأ إرسال للمحفظة {checksum_wallet[:8]}] {e}")
         return {"success": False, "wallet": checksum_wallet, "reason": "tx_error", "error": str(e)}
+
