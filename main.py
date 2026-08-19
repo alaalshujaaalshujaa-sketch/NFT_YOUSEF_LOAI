@@ -29,12 +29,12 @@ from buyer import (
 )
 from twitter_checker import get_twitter_username_from_opensea, get_cached_twitter
 
-# محاولة استخدام uvloop للسرعة
-try:
-    import uvloop
-    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-except ImportError:
-    pass
+# تعطيل uvloop لتجنب مشاكل التوافق مع بعض المنصات
+# try:
+#     import uvloop
+#     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+# except ImportError:
+#     pass
 
 load_dotenv()
 
@@ -89,7 +89,7 @@ PRIORITY_PROCESS_INTERVAL = 0.1 if FAST_MODE else 1
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
-    datefmt="%H:%M:%S.%f"[:-3],  # عرض الميلي ثانية
+    datefmt="%H:%M:%S.%f"[:-3],
 )
 log = logging.getLogger("auto-buyer-fast")
 
@@ -163,7 +163,7 @@ def get_cached_twitter_username(slug: str) -> Optional[str]:
     now = time.time()
     if slug in _twitter_cache:
         username, timestamp = _twitter_cache[slug]
-        if now - timestamp < (CACHE_TTL * 60):  # 1 دقيقة للتويتر
+        if now - timestamp < (CACHE_TTL * 60):
             return username
     return None
 
@@ -274,7 +274,6 @@ class TelegramBatch:
         if not self.messages:
             return
             
-        # تجميع حسب البوت
         grouped = {}
         for msg in self.messages:
             key = (msg["bot_token"], msg["chat_id"])
@@ -282,7 +281,6 @@ class TelegramBatch:
                 grouped[key] = []
             grouped[key].append(msg["text"])
         
-        # إرسال كل مجموعة
         for (bot_token, chat_id), texts in grouped.items():
             if len(texts) == 1:
                 await self.send_single(bot_token, chat_id, texts[0])
@@ -351,6 +349,16 @@ def build_single_wallet_success_msg(detail: dict, result: dict, chain_key: str) 
         f"🔗 {url}"
     )
 
+def build_watching_message(detail: dict, reason: str) -> str:
+    """بناء رسالة المراقبة"""
+    name = detail.get("collection_name") or detail.get("collection_slug")
+    return f"👀 <b>تحت المراقبة لمحافظتك</b>\n\nالمجموعة: <b>{name}</b>\nالسبب: {reason}\nسنحاول الشراء تلقائيًا فور توفر الفرصة."
+
+def build_gaveup_message(detail: dict, reason: str) -> str:
+    """بناء رسالة انتهاء الفرصة"""
+    name = detail.get("collection_name") or detail.get("collection_slug")
+    return f"❌ <b>انتهت الفرصة</b>\n\nالمجموعة: <b>{name}</b>\nالسبب: {reason}"
+
 async def purchase_task_for_wallet(
     w3, item, slug: str, contract_address: str, price_wei: int,
     max_per_wallet: Optional[int], remaining: int, eth_price_usd: float,
@@ -367,7 +375,6 @@ async def purchase_task_for_wallet(
         if wallet_addr in successful_mints.get(slug, set()):
             return {"success": False, "wallet": wallet_addr, "reason": "already_bought"}
 
-        # تنفيذ الشراء في thread منفصل
         res = await asyncio.get_event_loop().run_in_executor(
             EXECUTOR,
             attempt_purchase_single_wallet,
@@ -409,7 +416,6 @@ async def batch_purchase_mint(slug: str, chain_key: str, detail: dict) -> List[D
     w3 = W3_INSTANCES[chain_key]
     eth_price_usd = get_eth_price_usd()
 
-    # جلب السعر من cache إن أمكن
     cached_price = get_cached_price(contract_address)
     if cached_price is not None:
         price_wei = int(cached_price)
@@ -439,7 +445,6 @@ async def batch_purchase_mint(slug: str, chain_key: str, detail: dict) -> List[D
         item["current_detail"] = detail
         item["chain_key"] = chain_key
 
-    # تنفيذ جميع عمليات الشراء بالتوازي
     tasks = [
         purchase_task_for_wallet(
             w3, item, slug, contract_address,
@@ -451,7 +456,6 @@ async def batch_purchase_mint(slug: str, chain_key: str, detail: dict) -> List[D
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
     
-    # معالجة النتائج
     valid_results = []
     successful_count = 0
     for result in results:
@@ -503,7 +507,6 @@ async def measure_performance(slug: str, start_time: float):
         'timestamp': datetime.now()
     })
     
-    # الاحتفاظ بآخر 100 قياس فقط
     if len(PERFORMANCE_LOG) > PERFORMANCE_LOG_MAX:
         PERFORMANCE_LOG.pop(0)
     
@@ -512,7 +515,6 @@ async def measure_performance(slug: str, start_time: float):
     else:
         log.info(f"⚡ اكتشاف سريع لـ {slug}: {elapsed:.3f}s")
     
-    # عرض متوسط الأداء كل 10 اكتشافات
     if len(PERFORMANCE_LOG) % 10 == 0:
         avg = sum(x['time'] for x in PERFORMANCE_LOG[-10:]) / 10
         log.info(f"📊 متوسط وقت الاكتشاف (آخر 10): {avg:.3f}s")
@@ -528,7 +530,6 @@ async def evaluate_new_mint(slug: str, chain_key: str):
 
     in_flight.add(slug)
     try:
-        # 1. جلب تفاصيل المينت مع cache
         found, detail = await asyncio.get_event_loop().run_in_executor(
             EXECUTOR, fetch_drop_detail, slug, True
         )
@@ -540,13 +541,11 @@ async def evaluate_new_mint(slug: str, chain_key: str):
         if not stage or not started_today_local(stage):
             return
 
-        # 2. التحقق من السعر
         w3 = W3_INSTANCES[chain_key]
         eth_price_usd = get_eth_price_usd()
         contract_address = detail.get("contract_address")
         
         if contract_address:
-            # استخدام cache للسعر
             cached_price = get_cached_price(contract_address)
             if cached_price is not None:
                 price_wei = int(cached_price)
@@ -562,7 +561,6 @@ async def evaluate_new_mint(slug: str, chain_key: str):
                 mark_rejected(slug, "not_free")
                 return
 
-        # 3. التحقق من تويتر مع cache
         twitter_username = await asyncio.get_event_loop().run_in_executor(
             EXECUTOR, get_twitter_username_from_opensea, slug, OPENSEA_API_KEY
         )
@@ -574,15 +572,12 @@ async def evaluate_new_mint(slug: str, chain_key: str):
 
         log.info(f"✅ '{slug}': يوجد حساب X مربوط (@{twitter_username}) — جاري الشراء.")
 
-        # 4. تنفيذ الشراء
         results = await batch_purchase_mint(slug, chain_key, detail)
 
-        # تحديث حالة المراقبة
         if len(successful_mints.get(slug, set())) < len(WALLETS_DATA):
             watchlist[slug] = {"chain_key": chain_key, "detail": detail}
             broadcast_message(f"👀 <b>تحت المراقبة</b>\n\nالمجموعة: <b>{slug}</b>")
 
-        # تسجيل الأداء
         await measure_performance(slug, start_time)
 
     except Exception as e:
@@ -625,22 +620,21 @@ async def watch_loop():
             try:
                 chain_key = entry["chain_key"]
                 found, fresh_detail = await asyncio.get_event_loop().run_in_executor(
-                    EXECUTOR, fetch_drop_detail, slug, False  # force refresh
+                    EXECUTOR, fetch_drop_detail, slug, False
                 )
 
                 if not found or not fresh_detail or not fresh_detail.get("is_minting"):
                     watchlist.pop(slug, None)
-                    broadcast_message(f"❌ <b>انتهت الفرصة</b>\n\nالمجموعة: <b>{slug}</b>")
+                    broadcast_message(build_gaveup_message(entry["detail"], "المينت لم يعد نشطًا."))
                     continue
 
                 stage = fresh_detail.get("active_stage")
                 if not stage or (stage_has_ended(stage) and not fresh_detail.get("next_stage")):
                     watchlist.pop(slug, None)
-                    broadcast_message(f"❌ <b>انتهت المرحلة</b>\n\nالمجموعة: <b>{slug}</b>")
+                    broadcast_message(build_gaveup_message(fresh_detail, "انتهت المرحلة."))
                     continue
 
-                # محاولة الشراء مرة أخرى
-                await batch_purchase_mint(slug, chain_key, fresh_detail)
+                results = await batch_purchase_mint(slug, chain_key, fresh_detail)
 
                 if len(successful_mints.get(slug, set())) >= len(WALLETS_DATA):
                     watchlist.pop(slug, None)
@@ -658,11 +652,9 @@ async def health_monitor():
     while True:
         await asyncio.sleep(10)
         
-        # مراقبة قائمة الأولوية
         qsize = priority_queue.qsize()
         if qsize > 50:
             log.warning(f"⚠️ قائمة الأولوية كبيرة: {qsize}")
-            # معالجة سريعة للمتراكمة
             for _ in range(min(10, qsize)):
                 try:
                     slug, chain_key = priority_queue.get_nowait()
@@ -671,7 +663,6 @@ async def health_monitor():
                 except:
                     break
         
-        # مراقبة المعاملات المعلقة
         from buyer import _nonce_cache
         for wallet in WALLETS_DATA:
             wallet_addr = wallet["wallet"]
@@ -716,11 +707,9 @@ async def listen_opensea():
                     except asyncio.TimeoutError:
                         continue
 
-                    # فلترة سريعة جداً - التحقق من النص الخام
                     if not isinstance(raw, str) or len(raw) < 20:
                         continue
                         
-                    # تحقق سريع من وجود أحداث المينت
                     if 'item_transferred' not in raw and 'item_minted' not in raw:
                         continue
 
@@ -734,20 +723,17 @@ async def listen_opensea():
 
                     _, _, _, event_name, payload_wrapper = parsed
                     
-                    # تجاهل الأحداث غير المهمة
                     if event_name not in {'item_transferred', 'item_minted'}:
                         continue
 
                     payload = (payload_wrapper or {}).get("payload") or {}
                     item = payload.get("item", {}) or {}
                     
-                    # تحقق سريع من السلسلة
                     stream_chain_name = (item.get("chain", {}) or {}).get("name", "")
                     chain_key = STREAM_NAME_TO_CHAIN_KEY.get(stream_chain_name)
                     if chain_key is None:
                         continue
 
-                    # التحقق من أن المينت من الصفر
                     from_address = ((payload.get("from_account") or {}).get("address", "") or "").lower()
                     if from_address != ZERO_ADDRESS:
                         continue
@@ -756,7 +742,6 @@ async def listen_opensea():
                     if not slug:
                         continue
 
-                    # إضافة لقائمة الأولوية فوراً
                     await priority_queue.put((slug, chain_key))
 
         except (websockets.ConnectionClosed, OSError, asyncio.TimeoutError) as e:
