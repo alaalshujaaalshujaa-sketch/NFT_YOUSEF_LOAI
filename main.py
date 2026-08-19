@@ -31,7 +31,7 @@ BOT_ENABLED = os.environ.get("BOT_ENABLED", "false").lower() == "true"
 
 # إعدادات السرعة
 FAST_MODE = os.environ.get("FAST_MODE", "true").lower() == "true"
-PARALLEL_WORKERS = int(os.environ.get("PARALLEL_WORKERS", "20"))
+PARALLEL_WORKERS = int(os.environ.get("PARALLEL_WORKERS", "40"))
 RPC_TIMEOUT = int(os.environ.get("RPC_TIMEOUT", "5"))
 
 PRIVATE_KEYS = [k.strip() for k in os.environ.get("PRIVATE_KEYS", "").split(",") if k.strip()]
@@ -64,8 +64,8 @@ LOCAL_TZ = timezone(timedelta(hours=3))
 HEARTBEAT_INTERVAL = 30
 RECV_TIMEOUT = 2 if FAST_MODE else 5
 FREE_PRICE_THRESHOLD_USD = 0.01
-WATCH_POLL_INTERVAL_SECONDS = 3 if FAST_MODE else 15
-REJECTION_COOLDOWN_SECONDS = 30 if FAST_MODE else 120
+WATCH_POLL_INTERVAL_SECONDS = 2 if FAST_MODE else 15
+REJECTION_COOLDOWN_SECONDS = 20 if FAST_MODE else 120
 
 logging.basicConfig(
     level=logging.INFO,
@@ -373,7 +373,7 @@ async def priority_processor():
             priority_queue.task_done()
         except Exception as e:
             log.error(f"خطأ في معالج الأولوية: {e}")
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.05)
 
 # ============ Watch Loop ============
 async def watch_loop():
