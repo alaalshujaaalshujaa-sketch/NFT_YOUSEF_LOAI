@@ -29,10 +29,10 @@ load_dotenv()
 OPENSEA_API_KEY = os.environ["OPENSEA_API_KEY"]
 BOT_ENABLED = os.environ.get("BOT_ENABLED", "false").lower() == "true"
 
-# إعدادات السرعة - تم زيادة العمال
+# إعدادات السرعة
 FAST_MODE = os.environ.get("FAST_MODE", "true").lower() == "true"
-PARALLEL_WORKERS = int(os.environ.get("PARALLEL_WORKERS", "50"))  # زيادة من 20 إلى 50
-RPC_TIMEOUT = int(os.environ.get("RPC_TIMEOUT", "5"))  # زيادة من 3 إلى 5
+PARALLEL_WORKERS = int(os.environ.get("PARALLEL_WORKERS", "20"))
+RPC_TIMEOUT = int(os.environ.get("RPC_TIMEOUT", "5"))
 
 PRIVATE_KEYS = [k.strip() for k in os.environ.get("PRIVATE_KEYS", "").split(",") if k.strip()]
 WALLETS = [w.strip() for w in os.environ.get("WALLETS", "").split(",") if w.strip()]
@@ -60,12 +60,12 @@ DROPS_API_BASE = "https://api.opensea.io/api/v2/drops"
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 LOCAL_TZ = timezone(timedelta(hours=3))
 
-# إعدادات السرعة - تم تقليل الأوقات
+# إعدادات السرعة
 HEARTBEAT_INTERVAL = 30
 RECV_TIMEOUT = 2 if FAST_MODE else 5
 FREE_PRICE_THRESHOLD_USD = 0.01
-WATCH_POLL_INTERVAL_SECONDS = 2 if FAST_MODE else 15  # من 3 إلى 2
-REJECTION_COOLDOWN_SECONDS = 20 if FAST_MODE else 120  # من 30 إلى 20
+WATCH_POLL_INTERVAL_SECONDS = 3 if FAST_MODE else 15
+REJECTION_COOLDOWN_SECONDS = 30 if FAST_MODE else 120
 
 logging.basicConfig(
     level=logging.INFO,
@@ -129,33 +129,21 @@ def is_in_cooldown(slug: str) -> bool:
 def mark_rejected(slug: str):
     rejected_cooldown[slug] = time.time()
 
-# ============ ETH Price (مصلح) ============
+# ============ ETH Price ============
 def get_eth_price_usd() -> float:
-    """جلب سعر ETH مع cache سريع"""
     now = time.time()
     if _eth_price_cache["value"] and (now - _eth_price_cache["ts"] < 1):
         return _eth_price_cache["value"]
-    
     try:
         resp = requests.get(
             "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd",
-            timeout=3,
-            headers={"Accept": "application/json"}
+            timeout=2,
         )
-        if resp.status_code == 200:
-            data = resp.json()
-            # التحقق من وجود المفتاح بشكل صحيح
-            if isinstance(data, dict) and "ethereum" in data:
-                eth_data = data["ethereum"]
-                if isinstance(eth_data, dict) and "usd" in eth_data:
-                    price = eth_data["usd"]
-                    _eth_price_cache["value"] = price
-                    _eth_price_cache["ts"] = now
-                    return price
-        # إذا فشل، استخدم القيمة المخزنة
-        return _eth_price_cache["value"] or 3000.0
-    except Exception as e:
-        log.warning(f"[السعر] تعذر جلب سعر ETH: {e}")
+        price = resp.json()["ethereum"]["usd"]
+        _eth_price_cache["value"] = price
+        _eth_price_cache["ts"] = now
+        return price
+    except Exception:
         return _eth_price_cache["value"] or 3000.0
 
 # ============ OpenSea API ============
@@ -363,7 +351,6 @@ async def evaluate_new_mint(slug: str, chain_key: str):
         if not twitter_username:
             log.info(f"⏭️ تجاهل '{slug}': لا يوجد حساب X.")
             mark_rejected(slug)
-            in_flight.discard(slug)  # إزالة فورية لتسريع المعالجة
             return
 
         log.info(f"✅ '{slug}': يوجد حساب X (@{twitter_username}) — جاري الشراء.")
@@ -377,37 +364,16 @@ async def evaluate_new_mint(slug: str, chain_key: str):
     finally:
         in_flight.discard(slug)
 
-# ============ Priority Processor (محسّن) ============
+# ============ Priority Processor ============
 async def priority_processor():
-    """معالجة المينتات ذات الأولوية العالية - معالجة دفعات"""
     while True:
         try:
-            # معالجة دفعة واحدة بدلاً من واحدة تلو الأخرى
-            batch = []
-            batch_size = min(5, priority_queue.qsize())
-            for _ in range(batch_size):
-                try:
-                    slug, chain_key = priority_queue.get_nowait()
-                    batch.append((slug, chain_key))
-                    priority_queue.task_done()
-                except:
-                    break
-            
-            if batch:
-                # معالجة الدفعة بالتوازي
-                tasks = [evaluate_new_mint(slug, chain_key) for slug, chain_key in batch]
-                await asyncio.gather(*tasks, return_exceptions=True)
-            else:
-                # إذا كانت القائمة فارغة، انتظر
-                try:
-                    slug, chain_key = await asyncio.wait_for(priority_queue.get(), timeout=0.5)
-                    await evaluate_new_mint(slug, chain_key)
-                    priority_queue.task_done()
-                except asyncio.TimeoutError:
-                    pass
+            slug, chain_key = await priority_queue.get()
+            await evaluate_new_mint(slug, chain_key)
+            priority_queue.task_done()
         except Exception as e:
             log.error(f"خطأ في معالج الأولوية: {e}")
-        await asyncio.sleep(0.01)  # تسريع
+        await asyncio.sleep(0.1)
 
 # ============ Watch Loop ============
 async def watch_loop():
@@ -520,7 +486,7 @@ async def listen_opensea():
                         continue
 
                     slug = (payload.get("collection", {}) or {}).get("slug", "")
-                    if slug and slug not in rejected_cooldown and slug not in successful_mints:
+                    if slug:
                         await priority_queue.put((slug, chain_key))
 
         except Exception as e:
