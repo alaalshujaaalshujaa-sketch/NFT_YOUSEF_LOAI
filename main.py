@@ -1,6 +1,7 @@
 """
 النظام الكامل المحسن — 10 محافظ، لكل محفظة بوت تيليجرام خاص بها.
 المعيار الوحيد: وجود حساب X (Twitter)
+بدون رسائل اكتشاف - فقط رسائل الشراء
 """
 
 
@@ -37,7 +38,6 @@ load_dotenv()
 OPENSEA_API_KEY = os.environ["OPENSEA_API_KEY"]
 BOT_ENABLED = os.environ.get("BOT_ENABLED", "false").lower() == "true"
 
-# تفكيك المحافظ والمفاتيح وإعدادات التيليجرام
 PRIVATE_KEYS = [k.strip() for k in os.environ.get("PRIVATE_KEYS", "").split(",") if k.strip()]
 WALLETS = [w.strip() for w in os.environ.get("WALLETS", "").split(",") if w.strip()]
 TELEGRAM_BOT_TOKENS = [t.strip() for t in os.environ.get("TELEGRAM_BOT_TOKENS", "").split(",") if t.strip()]
@@ -46,7 +46,6 @@ TELEGRAM_CHAT_IDS = [c.strip() for c in os.environ.get("TELEGRAM_CHAT_IDS", "").
 if not (len(PRIVATE_KEYS) == len(WALLETS) == len(TELEGRAM_BOT_TOKENS) == len(TELEGRAM_CHAT_IDS)):
     raise ValueError("أعداد المفاتيح، المحافظ، توكنات البوتات، و Chat IDs غير متطابقة في ملف .env!")
 
-# إنشاء هيكلية المحافظ مع استراتيجيات متنوعة
 WALLETS_DATA: List[WalletData] = []
 for i in range(len(WALLETS)):
     if i < 3:
@@ -69,7 +68,6 @@ ALCHEMY_API_KEY_ETHEREUM = os.environ["ALCHEMY_API_KEY_ETHEREUM"]
 
 STREAM_URL = f"wss://stream.openseabeta.com/socket/websocket?token={OPENSEA_API_KEY}&vsn=2.0.0"
 DROPS_API_BASE = "https://api.opensea.io/api/v2/drops"
-COLLECTIONS_API = "https://api.opensea.io/api/v2/collections"
 
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 LOCAL_TZ = timezone(timedelta(hours=3))
@@ -81,9 +79,8 @@ FREE_PRICE_THRESHOLD_USD = 0.01
 WATCH_POLL_INTERVAL_SECONDS = 15
 REJECTION_COOLDOWN_SECONDS = 120
 SAVE_INTERVAL_SECONDS = 60
-MAX_CONCURRENT_EVALUATIONS = 5
+MAX_CONCURRENT_EVALUATIONS = 10  # زيادة للسرعة
 
-# ✅ إعدادات المستوى 2 و 3
 POLL_NEW_DROPS_INTERVAL = int(os.environ.get("POLL_NEW_DROPS_INTERVAL", "60"))
 MONITOR_RECENT_CONTRACTS = int(os.environ.get("MONITOR_RECENT_CONTRACTS", "30"))
 CONTRACT_MONITOR_INTERVAL = int(os.environ.get("CONTRACT_MONITOR_INTERVAL", "15"))
@@ -129,7 +126,6 @@ DETECTED_MINTS_FILE = Path("detected_mints.json")
 STATS_FILE = Path("wallet_stats.json")
 RECENT_CONTRACTS_FILE = Path("recent_contracts.json")
 
-# المتغيرات العامة
 successful_mints: Dict[str, Set[str]] = {}
 watchlist: Dict[str, Dict] = {}
 detected_mints: Dict[str, Dict] = {}
@@ -137,14 +133,10 @@ in_flight: Set[str] = set()
 rejected_cooldown: Dict[str, float] = {}
 _eth_price_cache = {"value": None, "ts": 0}
 evaluation_semaphore = asyncio.Semaphore(MAX_CONCURRENT_EVALUATIONS)
-
-# ✅ تتبع العقود المكتشفة للمستوى 3
 recent_contracts: Dict[str, Dict[str, Any]] = {}
 
-# ==================== نظام التخزين الدائم ====================
+# ==================== التخزين ====================
 class PersistentStorage:
-    """نظام تخزين دائم"""
-    
     def __init__(self):
         self.files = {
             "successful": SUCCESS_FILE,
@@ -163,35 +155,28 @@ class PersistentStorage:
         self._load_all()
     
     def _load_all(self):
-        # تحميل المينتات الناجحة
         if SUCCESS_FILE.exists():
             try:
                 with open(SUCCESS_FILE, 'r') as f:
                     data = json.load(f)
                     self.data["successful"] = {k: set(v) for k, v in data.items()}
-                    log.info(f"✅ تم تحميل {len(self.data['successful'])} مينت ناجح")
             except Exception as e:
                 log.warning(f"⚠️ تعذر تحميل المينتات الناجحة: {e}")
         
-        # تحميل قائمة المراقبة
         if WATCHLIST_FILE.exists():
             try:
                 with open(WATCHLIST_FILE, 'r') as f:
                     self.data["watchlist"] = json.load(f)
-                    log.info(f"✅ تم تحميل {len(self.data['watchlist'])} مجموعة تحت المراقبة")
             except Exception as e:
                 log.warning(f"⚠️ تعذر تحميل قائمة المراقبة: {e}")
         
-        # تحميل المينتات المكتشفة
         if DETECTED_MINTS_FILE.exists():
             try:
                 with open(DETECTED_MINTS_FILE, 'r') as f:
                     self.data["detected"] = json.load(f)
-                    log.info(f"✅ تم تحميل {len(self.data['detected'])} مينت مكتشف")
             except Exception as e:
                 log.warning(f"⚠️ تعذر تحميل المينتات المكتشفة: {e}")
         
-        # تحميل إحصائيات المحافظ
         if STATS_FILE.exists():
             try:
                 with open(STATS_FILE, 'r') as f:
@@ -199,16 +184,13 @@ class PersistentStorage:
                     for wd in WALLETS_DATA:
                         if wd.wallet in self.data["stats"]:
                             wd.stats.update(self.data["stats"][wd.wallet])
-                    log.info(f"✅ تم تحميل إحصائيات {len(self.data['stats'])} محفظة")
             except Exception as e:
                 log.warning(f"⚠️ تعذر تحميل الإحصائيات: {e}")
         
-        # تحميل العقود المكتشفة
         if RECENT_CONTRACTS_FILE.exists():
             try:
                 with open(RECENT_CONTRACTS_FILE, 'r') as f:
                     self.data["contracts"] = json.load(f)
-                    log.info(f"✅ تم تحميل {len(self.data['contracts'])} عقد مكتشف")
             except Exception as e:
                 log.warning(f"⚠️ تعذر تحميل العقود المكتشفة: {e}")
     
@@ -235,12 +217,11 @@ class PersistentStorage:
             with open(RECENT_CONTRACTS_FILE, 'w') as f:
                 json.dump(self.data["contracts"], f, indent=2)
             
-            log.debug("💾 تم حفظ البيانات بنجاح")
+            log.debug("💾 تم حفظ البيانات")
         except Exception as e:
             log.error(f"❌ خطأ في حفظ البيانات: {e}")
 
 storage = PersistentStorage()
-
 successful_mints = storage.data["successful"]
 watchlist = storage.data["watchlist"]
 detected_mints = storage.data["detected"]
@@ -253,10 +234,8 @@ async def periodic_save():
 
 # ==================== نظام الكشف ====================
 class MintDetector:
-    """كاشف المينتات"""
     def __init__(self):
         self.detection_count = 0
-        self.last_detection_time = None
         self.detection_sources = {
             "websocket": 0,
             "polling": 0,
@@ -282,10 +261,6 @@ class MintDetector:
             if chain_key is None:
                 return False, None, None
             
-            quantity = payload.get("quantity", 0)
-            if quantity <= 0:
-                return False, None, None
-            
             return True, chain_key, slug
             
         except Exception as e:
@@ -293,58 +268,34 @@ class MintDetector:
     
     def record_detection(self, slug: str, source: str = "websocket"):
         self.detection_count += 1
-        self.last_detection_time = time.time()
         self.detection_sources[source] = self.detection_sources.get(source, 0) + 1
-        log.info(f"🔔 تم اكتشاف مينت #{self.detection_count}: {slug} (المصدر: {source})")
+        log.info(f"🔔 مينت: {slug} (المصدر: {source})")
 
 detector = MintDetector()
 
-# ==================== ✅ نظام التقييم المبسط (معيار واحد: وجود X) ====================
+# ==================== ✅ تقييم مبسط (معيار واحد: X) ====================
 class MintEvaluator:
-    """مقيم المينتات - المعيار الوحيد: وجود حساب X"""
-    
     def __init__(self):
         self.evaluation_history: Dict[str, Dict] = {}
     
     def evaluate_quality(self, slug: str, detail: dict) -> Dict[str, Any]:
-        """✅ تقييم مبسط - فقط يتحقق من وجود X"""
-        quality = {
-            'has_twitter': False,
-            'twitter_username': None,
-            'recommendation': 'skip',
-            'reason': ''
-        }
-        
         twitter = detail.get('twitter_username')
         
-        if twitter:
-            quality['has_twitter'] = True
-            quality['twitter_username'] = twitter
-            quality['recommendation'] = 'buy'  # ✅ يوجد X → شراء
-            quality['reason'] = f"✅ يوجد حساب X: @{twitter}"
-            log.info(f"✅ '{slug}' لديه X: @{twitter} → شراء")
-        else:
-            quality['recommendation'] = 'skip'
-            quality['reason'] = "❌ لا يوجد حساب X → تخطي"
-            log.info(f"⏭️ '{slug}' لا يوجد X → تخطي")
+        quality = {
+            'has_twitter': bool(twitter),
+            'twitter_username': twitter,
+            'recommendation': 'buy' if twitter else 'skip',
+        }
         
         self.evaluation_history[slug] = quality
         return quality
-    
-    def get_recommendation(self, slug: str) -> str:
-        if slug in self.evaluation_history:
-            return self.evaluation_history[slug]['recommendation']
-        return 'skip'
 
 evaluator = MintEvaluator()
 
-# ==================== نظام رسائل التيليجرام ====================
+# ==================== ✅ تيليجرام - فقط رسائل الشراء ====================
 class TelegramManager:
-    """مدير رسائل التيليجرام"""
     def __init__(self):
         self.send_queue: asyncio.Queue = asyncio.Queue()
-        self.message_count = 0
-        self.last_message_time = None
     
     def enqueue(self, bot_token: str, chat_id: str, text: str):
         self.send_queue.put_nowait({
@@ -367,7 +318,7 @@ class TelegramManager:
             msg = await self.send_queue.get()
             try:
                 telegram_api = f"https://api.telegram.org/bot{msg['bot_token']}"
-                response = await asyncio.to_thread(
+                await asyncio.to_thread(
                     requests.post,
                     f"{telegram_api}/sendMessage",
                     data={
@@ -377,78 +328,35 @@ class TelegramManager:
                     },
                     timeout=10,
                 )
-                
-                if response.status_code == 200:
-                    self.message_count += 1
-                    self.last_message_time = time.time()
-                else:
-                    log.warning(f"⚠️ فشل إرسال رسالة: {response.status_code}")
-                    
             except Exception as e:
                 log.error(f"❌ خطأ إرسال تليجرام: {e}")
             
             self.send_queue.task_done()
             await asyncio.sleep(0.1)
     
+    # ✅ فقط رسالة شراء ناجح
     def build_success_message(self, detail: dict, result: dict, chain_key: str) -> str:
         name = detail.get("collection_name") or detail.get("collection_slug")
         url = detail.get("opensea_url", "")
-        chain_label = "Robinhood Chain" if chain_key == "robinhood" else "Ethereum Mainnet"
+        chain_label = "Robinhood" if chain_key == "robinhood" else "Ethereum"
         w_short = result['wallet'][:6] + "..." + result['wallet'][-4:]
         
-        twitter = detail.get('twitter_username', 'غير معروف')
+        twitter = detail.get('twitter_username', '')
+        twitter_text = f"\nحساب X: @{twitter}" if twitter else ""
         
         return (
-            f"✅ <b>تم الشراء بنجاح!</b> ({chain_label})\n\n"
+            f"✅ <b>تم الشراء!</b> ({chain_label})\n\n"
             f"المحفظة: <code>{w_short}</code>\n"
-            f"المجموعة: <b>{name}</b>\n"
-            f"حساب X: @{twitter}\n"
+            f"المجموعة: <b>{name}</b>{twitter_text}\n"
             f"الكمية: {result['quantity']}\n"
             f"رسوم الغاز: ${result['gas_fee_usd']:.4f}\n"
             f"المعاملة: <code>{result['tx_hash'][:10]}...</code>\n"
             f"🔗 {url}"
         )
-    
-    def build_detection_message(self, slug: str, quality: Dict[str, Any], detail: dict, source: str = "websocket") -> str:
-        name = detail.get('collection_name') or slug
-        reason = quality['reason']
-        
-        source_labels = {
-            "websocket": "🔵 WebSocket",
-            "polling": "🟢 فحص دوري",
-            "contract_monitor": "🟣 مراقبة العقود",
-        }
-        source_label = source_labels.get(source, "❓ غير معروف")
-        
-        if quality['has_twitter']:
-            status = "✅ <b>مؤهل للشراء</b>"
-        else:
-            status = "❌ <b>غير مؤهل</b>"
-        
-        return (
-            f"🔔 <b>تم اكتشاف مينت!</b> ({source_label})\n\n"
-            f"المجموعة: <b>{name}</b>\n"
-            f"الرابط: {detail.get('opensea_url', '')}\n\n"
-            f"📊 <b>التقييم:</b>\n"
-            f"{reason}\n\n"
-            f"الحالة: {status}"
-        )
 
 telegram = TelegramManager()
 
 # ==================== دوال مساعدة ====================
-def is_in_cooldown(slug: str) -> bool:
-    ts = rejected_cooldown.get(slug)
-    if ts is None:
-        return False
-    if time.time() - ts >= REJECTION_COOLDOWN_SECONDS:
-        rejected_cooldown.pop(slug, None)
-        return False
-    return True
-
-def mark_rejected(slug: str):
-    rejected_cooldown[slug] = time.time()
-
 def get_eth_price_usd() -> float:
     now = time.time()
     if _eth_price_cache["value"] and (now - _eth_price_cache["ts"] < 300):
@@ -464,7 +372,6 @@ def get_eth_price_usd() -> float:
         _eth_price_cache["ts"] = now
         return price
     except Exception as e:
-        log.warning(f"⚠️ [السعر] تعذر جلب سعر ETH: {e}")
         return _eth_price_cache["value"] or 3000.0
 
 async def fetch_drop_detail(slug: str) -> Tuple[Optional[bool], Optional[Dict]]:
@@ -477,11 +384,8 @@ async def fetch_drop_detail(slug: str) -> Tuple[Optional[bool], Optional[Dict]]:
             ) as resp:
                 if resp.status == 200:
                     return True, await resp.json()
-                if resp.status == 404:
-                    return False, None
-                return None, None
+                return False, None
     except Exception as e:
-        log.warning(f"⚠️ [Drops API] خطأ: {e}")
         return None, None
 
 def parse_iso(ts: str):
@@ -496,17 +400,11 @@ def started_today_local(stage: dict) -> bool:
         return False
     return start.astimezone(LOCAL_TZ).date() == datetime.now(LOCAL_TZ).date()
 
-def stage_has_ended(stage: dict) -> bool:
-    end = parse_iso(stage.get("end_time", ""))
-    if not end:
-        return False
-    return datetime.now(timezone.utc) > end
-
 def is_free_or_negligible(price_wei: int, eth_price_usd: float) -> bool:
     price_usd = (price_wei / 1e18) * eth_price_usd
     return price_usd < FREE_PRICE_THRESHOLD_USD
 
-# ==================== منطق الشراء ====================
+# ==================== الشراء ====================
 async def try_buy_now_multi_wallet(
     slug: str,
     chain_key: str,
@@ -520,11 +418,11 @@ async def try_buy_now_multi_wallet(
     total_supply = int(detail.get("total_supply") or 0)
     remaining = max_supply - total_supply
     if remaining <= 0:
-        return [{"success": False, "reason": "sold_out"}]
+        return None
     
     contract_address = detail.get("contract_address")
     if not contract_address:
-        return [{"success": False, "reason": "no_contract_address"}]
+        return None
     
     w3 = W3_INSTANCES[chain_key]
     eth_price_usd = get_eth_price_usd()
@@ -532,9 +430,7 @@ async def try_buy_now_multi_wallet(
     onchain_price = await get_onchain_public_price_wei(w3, contract_address)
     price_wei = onchain_price if onchain_price is not None else int(stage.get("price", "0"))
     
-    # ✅ فقط المجاني
     if not is_free_or_negligible(price_wei, eth_price_usd):
-        log.info(f"💰 '{slug}' مدفوع - تخطي")
         return None
     
     max_per_wallet_raw = stage.get("max_total_mintable_by_wallet") or stage.get("max_per_wallet")
@@ -548,7 +444,7 @@ async def try_buy_now_multi_wallet(
     ]
     
     if not pending_wallets:
-        return [{"success": False, "reason": "all_wallets_completed"}]
+        return None
     
     for wd in pending_wallets:
         wd.current_detail = detail
@@ -575,6 +471,7 @@ async def try_buy_now_multi_wallet(
                 i for i, wd in enumerate(WALLETS_DATA)
                 if wd.wallet == result.wallet
             )
+            # ✅ فقط رسالة شراء ناجح
             msg = telegram.build_success_message(detail, {
                 'wallet': result.wallet,
                 'quantity': result.quantity,
@@ -586,12 +483,12 @@ async def try_buy_now_multi_wallet(
     storage.save_all()
     return [vars(r) for r in results]
 
-# ==================== ✅ المستوى 1: الكشف عبر WebSocket ====================
-async def evaluate_new_mint(slug: str, chain_key: str, source: str = "websocket"):
-    """تقييم المينت - المعيار الوحيد: وجود X"""
+# ==================== ✅ التقييم والشراء (بدون رسائل) ====================
+async def evaluate_and_buy(slug: str, chain_key: str, source: str = "websocket"):
+    """تقييم سريع وشراء - بدون أي رسائل"""
     async with evaluation_semaphore:
         if (len(successful_mints.get(slug, set())) >= len(WALLETS_DATA) or
-            slug in watchlist or slug in in_flight or is_in_cooldown(slug)):
+            slug in watchlist or slug in in_flight):
             return
         
         in_flight.add(slug)
@@ -610,16 +507,12 @@ async def evaluate_new_mint(slug: str, chain_key: str, source: str = "websocket"
                     'chain': chain_key,
                     'slug': slug,
                     'name': detail.get('collection_name') or slug,
-                    'purchased': False,
-                    'purchased_by': [],
-                    'total_supply': detail.get('total_supply', 0),
-                    'max_supply': detail.get('max_supply', 0),
                     'detected_by': source,
                 }
                 storage.save_all()
                 detector.record_detection(slug, source)
             
-            # ✅ تتبع العقد للمستوى 3
+            # تتبع العقد للمستوى 3
             contract_address = detail.get("contract_address")
             if contract_address:
                 recent_contracts[contract_address.lower()] = {
@@ -646,31 +539,20 @@ async def evaluate_new_mint(slug: str, chain_key: str, source: str = "websocket"
                 price_wei = onchain_price if onchain_price is not None else int(stage.get("price", "0"))
                 
                 if not is_free_or_negligible(price_wei, eth_price_usd):
-                    log.info(f"💰 '{slug}' مدفوع - تخطي")
-                    mark_rejected(slug)
                     return
             
-            # ✅ الشرط الوحيد: التحقق من وجود X
+            # ✅ الشرط الوحيد: وجود X
             twitter_username = await asyncio.to_thread(
                 get_twitter_username_from_opensea, slug, OPENSEA_API_KEY
             )
-            detail['twitter_username'] = twitter_username
             
-            # ✅ تقييم مبسط
-            quality = evaluator.evaluate_quality(slug, detail)
-            
-            # ✅ إرسال إشعار بالاكتشاف
-            telegram.broadcast(
-                telegram.build_detection_message(slug, quality, detail, source)
-            )
-            
-            # ✅ إذا كان يوجد X → شراء فوري
-            if quality['recommendation'] == 'buy':
-                log.info(f"🛒 شراء '{slug}' - يوجد X: @{twitter_username}")
+            # ✅ إذا كان يوجد X → شراء فوري (بدون رسائل)
+            if twitter_username:
+                detail['twitter_username'] = twitter_username
+                log.info(f"🛒 شراء '{slug}' - X: @{twitter_username}")
                 results = await try_buy_now_multi_wallet(slug, chain_key, detail)
                 
                 if results is None or len(successful_mints.get(slug, set())) < len(WALLETS_DATA):
-                    # إضافة للمراقبة لمحاولة لاحقة
                     watchlist[slug] = {
                         "chain_key": chain_key,
                         "detail": detail,
@@ -679,12 +561,10 @@ async def evaluate_new_mint(slug: str, chain_key: str, source: str = "websocket"
                     }
                     storage.save_all()
             else:
-                # لا يوجد X → تخطي
                 log.info(f"⏭️ '{slug}' لا يوجد X - تخطي")
-                mark_rejected(slug)
             
         except Exception as e:
-            log.error(f"❌ خطأ بتقييم '{slug}': {e}")
+            log.error(f"❌ خطأ: {e}")
         finally:
             in_flight.discard(slug)
 
@@ -698,8 +578,6 @@ async def poll_new_drops():
             
             if not BOT_ENABLED:
                 continue
-            
-            log.debug(f"🔄 فحص دوري للمينتات الجديدة...")
             
             drops = await asyncio.to_thread(fetch_recent_drops_fast)
             
@@ -716,7 +594,7 @@ async def poll_new_drops():
                 
                 if slug not in detected_mints:
                     asyncio.create_task(
-                        evaluate_new_mint(slug, chain_key, source="polling")
+                        evaluate_and_buy(slug, chain_key, source="polling")
                     )
         
         except Exception as e:
@@ -785,14 +663,14 @@ async def monitor_contracts():
                         current_time = int(time.time())
                         
                         if start_time and abs(current_time - start_time) < 120:
-                            log.info(f"🔍 عقد '{slug}' بدأ للتو - شراء (مراقبة العقود)")
+                            log.info(f"🔍 عقد '{slug}' بدأ للتو")
                             eth_price_usd = get_eth_price_usd()
                             
                             if is_free_or_negligible(public_drop, eth_price_usd):
                                 found, detail = await fetch_drop_detail(slug)
                                 if found and detail:
                                     asyncio.create_task(
-                                        evaluate_new_mint(slug, chain_key, source="contract_monitor")
+                                        evaluate_and_buy(slug, chain_key, source="contract_monitor")
                                     )
                 except asyncio.TimeoutError:
                     continue
@@ -842,7 +720,7 @@ async def watch_loop():
                     continue
                 
                 stage = fresh_detail.get("active_stage")
-                if not stage or (stage_has_ended(stage) and not fresh_detail.get("next_stage")):
+                if not stage or not started_today_local(stage):
                     watchlist.pop(slug, None)
                     storage.save_all()
                     continue
@@ -883,7 +761,7 @@ async def watch_loop():
             finally:
                 in_flight.discard(slug)
 
-# ==================== 🔵 الاتصال بـ OpenSea ====================
+# ==================== 🔵 WebSocket ====================
 async def listen_opensea():
     msg_ref = 0
     
@@ -894,7 +772,7 @@ async def listen_opensea():
                 ping_interval=None,
                 open_timeout=15
             ) as ws:
-                log.info(f"✅ متصل بـ OpenSea Stream — يراقب لـ {len(WALLETS_DATA)} محافظ")
+                log.info(f"✅ متصل بـ OpenSea Stream")
                 
                 join_ref = str(msg_ref)
                 await ws.send(json.dumps([
@@ -940,14 +818,11 @@ async def listen_opensea():
                         detected_mints[slug]['detected_at'] = time.time()
                         continue
                     
-                    asyncio.create_task(evaluate_new_mint(slug, chain_key, source="websocket"))
+                    asyncio.create_task(evaluate_and_buy(slug, chain_key, source="websocket"))
                     
-        except (websockets.ConnectionClosed, OSError, asyncio.TimeoutError) as e:
-            log.warning(f"⚠️ انقطع الاتصال ({e}). إعادة الاتصال...")
-            await asyncio.sleep(3)
         except Exception as e:
-            log.error(f"❌ خطأ غير متوقع: {e}")
-            await asyncio.sleep(5)
+            log.warning(f"⚠️ انقطع الاتصال: {e}")
+            await asyncio.sleep(3)
 
 # ==================== واجهة الأوامر ====================
 async def command_handler():
@@ -958,35 +833,18 @@ async def command_handler():
             for i, wd in enumerate(WALLETS_DATA):
                 stats_msg = format_wallet_stats(wd)
                 telegram.send_to_wallet(i, stats_msg)
-            
-            detection_stats = (
-                f"📊 <b>إحصائيات الكشف</b>\n\n"
-                f"🔵 WebSocket: {detector.detection_sources['websocket']}\n"
-                f"🟢 الفحص الدوري: {detector.detection_sources['polling']}\n"
-                f"🟣 مراقبة العقود: {detector.detection_sources['contract_monitor']}\n"
-                f"📦 إجمالي المكتشفات: {detector.detection_count}\n"
-                f"👀 تحت المراقبة: {len(watchlist)}\n"
-                f"✅ مينتات ناجحة: {len(successful_mints)}"
-            )
-            telegram.broadcast(detection_stats)
 
-# ==================== التشغيل الرئيسي ====================
+# ==================== التشغيل ====================
 async def run():
     if not BOT_ENABLED:
         log.warning("🔴 BOT_ENABLED=false")
-        telegram.broadcast("🔴 البوت شغال لكن بوضع الإيقاف (BOT_ENABLED=false)")
-        await telegram.sender_loop()
         return
     
     telegram.broadcast(
-        f"✅ <b>تم تشغيل النظام بنجاح!</b>\n\n"
+        f"✅ <b>تم تشغيل النظام</b>\n\n"
         f"عدد المحافظ: {len(WALLETS_DATA)}\n"
-        f"المعيار الوحيد: وجود حساب X\n\n"
-        f"🟢 <b>مستويات الكشف:</b>\n"
-        f"1️⃣ WebSocket (فوري)\n"
-        f"2️⃣ فحص دوري ({POLL_NEW_DROPS_INTERVAL} ثانية)\n"
-        f"3️⃣ مراقبة العقود النشطة\n\n"
-        f"النظام جاهز لكشف المينتات المجانية التي لديها X"
+        f"المعيار: وجود X فقط\n"
+        f"مستويات الكشف: WebSocket + فحص دوري + مراقبة عقود"
     )
     
     await asyncio.gather(
@@ -1001,19 +859,17 @@ async def run():
     )
 
 def main():
-    backoff = 2
     while True:
         try:
             asyncio.run(run())
         except KeyboardInterrupt:
-            log.info("🛑 تم الإيقاف يدوياً")
+            log.info("🛑 تم الإيقاف")
             storage.save_all()
             break
         except Exception as e:
-            log.critical(f"❌ توقف غير متوقع: {e}")
+            log.critical(f"❌ توقف: {e}")
             storage.save_all()
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 30)
+            time.sleep(5)
             continue
         else:
             break
