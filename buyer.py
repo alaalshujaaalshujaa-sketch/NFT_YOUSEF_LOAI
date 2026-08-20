@@ -1,6 +1,5 @@
 """
 محرك الشراء التلقائي المتعدد المحافظ عبر عقد SeaDrop.
-يدعم EIP-1559، إعادة المحاولة، وإدارة الأخطاء المتقدمة.
 """
 
 import asyncio
@@ -9,7 +8,7 @@ from typing import Optional, Dict, Any
 from dataclasses import dataclass
 
 from web3 import Web3
-from web3.exceptions import TransactionNotFound, ContractLogicError, TimeExhausted
+from web3.exceptions import ContractLogicError, TimeExhausted
 
 log = logging.getLogger("buyer")
 
@@ -150,40 +149,9 @@ def decide_quantity(max_per_wallet: Optional[int], remaining_supply: int) -> int
         qty = LIMITED_BUY_QTY
     return max(1, min(qty, remaining_supply))
 
-def build_eip1559_transaction(w3: Web3, tx_dict: dict) -> dict:
-    """بناء معاملة باستخدام EIP-1559"""
-    try:
-        # جلب البيانات الحديثة
-        latest_block = w3.eth.get_block('pending')
-        base_fee = latest_block.get('baseFeePerGas', w3.eth.gas_price // 2)
-        
-        # تقدير رسوم الأولوية المثلى
-        try:
-            max_priority = w3.eth.max_priority_fee
-        except:
-            max_priority = w3.eth.gas_price // 10  # 10% من السعر كبديل
-        
-        # حساب الرسوم القصوى (2x قاعدة + الأولوية)
-        max_fee = int(base_fee * 2 + max_priority)
-        
-        # تحديث المعاملة
-        eip1559_tx = {
-            **tx_dict,
-            'maxFeePerGas': max_fee,
-            'maxPriorityFeePerGas': max_priority,
-            'type': 2,  # EIP-1559
-        }
-        
-        # إزالة الحقول القديمة إذا وجدت
-        eip1559_tx.pop('gasPrice', None)
-        
-        return eip1559_tx
-    except Exception as e:
-        log.warning(f"⚠️ تعذر بناء EIP-1559، استخدام الطريقة القديمة: {e}")
-        return tx_dict
+# ==================== دالة الشراء الرئيسية (متوافقة مع main.py) ====================
 
-# ==================== إرسال المعاملة مع إعادة المحاولة ====================
-async def send_transaction_with_retry(
+def attempt_purchase_single_wallet(
     w3: Web3,
     private_key: str,
     wallet_address: str,
@@ -193,70 +161,17 @@ async def send_transaction_with_retry(
     remaining_supply: int,
     eth_price_usd: float,
     max_gas_fee_usd: float,
-    max_retries: int = 3,
 ) -> Dict[str, Any]:
     """
-    محاولة الشراء بمحفظة واحدة مع إعادة المحاولة التلقائية
+    محاولة الشراء بمحفظة واحدة (متوافقة مع main.py القديم)
+    هذه الدالة تعمل بشكل متزامن (synchronous) كما هو متوقع في main.py
     """
-    checksum_wallet = Web3.to_checksum_address(wallet_address)
-    checksum_contract = Web3.to_checksum_address(nft_contract)
-    
-    for attempt in range(max_retries):
-        try:
-            return await _attempt_purchase(
-                w3, private_key, checksum_wallet, checksum_contract,
-                price_wei_per_token, max_per_wallet, remaining_supply,
-                eth_price_usd, max_gas_fee_usd
-            )
-        except Exception as e:
-            error_msg = str(e).lower()
-            
-            # حالات قابلة لإعادة المحاولة
-            retryable_errors = [
-                "timeout", "connection", "network", "nonce",
-                "replacement transaction underpriced",
-                "already known", "underpriced"
-            ]
-            
-            if any(err in error_msg for err in retryable_errors):
-                if attempt < max_retries - 1:
-                    delay = min(RETRY_BACKOFF_FACTOR ** attempt, MAX_RETRY_DELAY)
-                    log.warning(f"🔄 محاولة {attempt + 1}/{max_retries} فشلت: {e}. إعادة المحاولة بعد {delay:.1f} ثوانٍ")
-                    await asyncio.sleep(delay)
-                    continue
-                else:
-                    log.error(f"❌ فشلت جميع المحاولات ({max_retries}) للمحفظة {checksum_wallet[:8]}")
-                    return {
-                        "success": False,
-                        "wallet": checksum_wallet,
-                        "reason": "retry_exhausted",
-                        "error": str(e)
-                    }
-            else:
-                # أخطاء غير قابلة لإعادة المحاولة
-                log.error(f"❌ فشل نهائي للمحفظة {checksum_wallet[:8]}: {e}")
-                return {
-                    "success": False,
-                    "wallet": checksum_wallet,
-                    "reason": "permanent_error",
-                    "error": str(e)
-                }
-    
-    return {"success": False, "wallet": checksum_wallet, "reason": "unknown_error"}
+    try:
+        checksum_wallet = Web3.to_checksum_address(wallet_address)
+        checksum_contract = Web3.to_checksum_address(nft_contract)
+    except Exception as e:
+        return {"success": False, "wallet": wallet_address, "reason": "invalid_address", "error": str(e)}
 
-async def _attempt_purchase(
-    w3: Web3,
-    private_key: str,
-    checksum_wallet: str,
-    checksum_contract: str,
-    price_wei_per_token: int,
-    max_per_wallet: Optional[int],
-    remaining_supply: int,
-    eth_price_usd: float,
-    max_gas_fee_usd: float,
-) -> Dict[str, Any]:
-    """محاولة الشراء الفعلية"""
-    
     # 1. التحقق من الرصيد
     balance_usd = get_wallet_balance_usd(w3, checksum_wallet, eth_price_usd)
     if balance_usd < MIN_BALANCE_RESERVE_USD:
@@ -290,8 +205,8 @@ async def _attempt_purchase(
     quantity = decide_quantity(max_per_wallet, remaining_supply)
     total_value = price_wei_per_token * quantity
 
-    # 5. بناء المعاملة
     try:
+        # 5. بناء المعاملة
         contract = w3.eth.contract(address=SEADROP_ADDRESS, abi=SEADROP_ABI)
         nonce = w3.eth.get_transaction_count(checksum_wallet, "pending")
 
@@ -326,11 +241,9 @@ async def _attempt_purchase(
                 "error": str(e)
             }
 
-        # 7. تطبيق EIP-1559
-        tx = build_eip1559_transaction(w3, tx)
-
-        # 8. التحقق النهائي من التكلفة
-        actual_gas_fee_usd = (tx["gas"] * tx.get("maxFeePerGas", w3.eth.gas_price) / 1e18) * eth_price_usd
+        # 7. التحقق من تكلفة الغاز
+        gas_price = w3.eth.gas_price
+        actual_gas_fee_usd = (tx["gas"] * gas_price / 1e18) * eth_price_usd
         if actual_gas_fee_usd > max_gas_fee_usd:
             return {
                 "success": False,
@@ -339,44 +252,22 @@ async def _attempt_purchase(
                 "gas_fee_usd": actual_gas_fee_usd
             }
 
-        total_cost_wei = total_value + (tx["gas"] * tx.get("maxFeePerGas", w3.eth.gas_price))
+        # 8. التحقق من الرصيد الكافي
+        total_cost_wei = total_value + (tx["gas"] * gas_price)
         wallet_balance_wei = w3.eth.get_balance(checksum_wallet)
         if wallet_balance_wei < total_cost_wei:
             return {
                 "success": False,
                 "wallet": checksum_wallet,
-                "reason": "insufficient_funds"
+                "reason": "insufficient_funds_for_total_cost"
             }
 
         # 9. توقيع وإرسال المعاملة
         signed = w3.eth.account.sign_transaction(tx, private_key=private_key)
-        
-        # إرسال مع متابعة الوقت
-        tx_hash = await asyncio.to_thread(
-            w3.eth.send_raw_transaction,
-            signed.raw_transaction
-        )
-        
-        log.info(f"✅ [شراء - {checksum_wallet[:8]}] {tx_hash.hex()} — كمية: {quantity}")
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
 
-        # 10. انتظار التأكيد (اختياري)
-        try:
-            receipt = await asyncio.to_thread(
-                w3.eth.wait_for_transaction_receipt,
-                tx_hash,
-                timeout=60
-            )
-            if receipt.status != 1:
-                return {
-                    "success": False,
-                    "wallet": checksum_wallet,
-                    "reason": "transaction_failed",
-                    "tx_hash": tx_hash.hex()
-                }
-        except TimeExhausted:
-            log.warning(f"⚠️ لم يتم تأكيد المعاملة {tx_hash.hex()} خلال 60 ثانية")
-            # نعتبرها ناجحة مؤقتاً، سنتحقق لاحقاً
-
+        log.info(f"✅ [شراء ناجح - {checksum_wallet[:8]}] {tx_hash.hex()} — كمية: {quantity}")
+        
         return {
             "success": True,
             "wallet": checksum_wallet,
@@ -395,7 +286,68 @@ async def _attempt_purchase(
             return {"success": False, "wallet": checksum_wallet, "reason": "nonce_error", "error": error_msg}
         elif "insufficient funds" in error_msg.lower():
             return {"success": False, "wallet": checksum_wallet, "reason": "insufficient_funds", "error": error_msg}
-        elif "replacement transaction underpriced" in error_msg.lower():
-            return {"success": False, "wallet": checksum_wallet, "reason": "underpriced", "error": error_msg}
         else:
             return {"success": False, "wallet": checksum_wallet, "reason": "tx_error", "error": error_msg}
+
+# ==================== دالة الشراء غير المتزامنة (للإصدارات الجديدة) ====================
+
+async def send_transaction_with_retry(
+    w3: Web3,
+    private_key: str,
+    wallet_address: str,
+    nft_contract: str,
+    price_wei_per_token: int,
+    max_per_wallet: Optional[int],
+    remaining_supply: int,
+    eth_price_usd: float,
+    max_gas_fee_usd: float,
+    max_retries: int = 3,
+) -> Dict[str, Any]:
+    """
+    محاولة الشراء بمحفظة واحدة مع إعادة المحاولة التلقائية (نسخة غير متزامنة)
+    """
+    for attempt in range(max_retries):
+        try:
+            # استخدام الدالة المتزامنة مع to_thread
+            result = await asyncio.to_thread(
+                attempt_purchase_single_wallet,
+                w3, private_key, wallet_address, nft_contract,
+                price_wei_per_token, max_per_wallet, remaining_supply,
+                eth_price_usd, max_gas_fee_usd
+            )
+            return result
+        except Exception as e:
+            error_msg = str(e).lower()
+            
+            # حالات قابلة لإعادة المحاولة
+            retryable_errors = [
+                "timeout", "connection", "network", "nonce",
+                "replacement transaction underpriced",
+                "already known", "underpriced"
+            ]
+            
+            if any(err in error_msg for err in retryable_errors):
+                if attempt < max_retries - 1:
+                    delay = min(RETRY_BACKOFF_FACTOR ** attempt, MAX_RETRY_DELAY)
+                    log.warning(f"🔄 محاولة {attempt + 1}/{max_retries} فشلت: {e}. إعادة المحاولة بعد {delay:.1f} ثوانٍ")
+                    await asyncio.sleep(delay)
+                    continue
+                else:
+                    log.error(f"❌ فشلت جميع المحاولات ({max_retries}) للمحفظة {wallet_address[:8]}")
+                    return {
+                        "success": False,
+                        "wallet": wallet_address,
+                        "reason": "retry_exhausted",
+                        "error": str(e)
+                    }
+            else:
+                # أخطاء غير قابلة لإعادة المحاولة
+                log.error(f"❌ فشل نهائي للمحفظة {wallet_address[:8]}: {e}")
+                return {
+                    "success": False,
+                    "wallet": wallet_address,
+                    "reason": "permanent_error",
+                    "error": str(e)
+                }
+    
+    return {"success": False, "wallet": wallet_address, "reason": "unknown_error"}
