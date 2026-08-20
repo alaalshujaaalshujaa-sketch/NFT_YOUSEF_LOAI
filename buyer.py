@@ -15,12 +15,34 @@ from decimal import Decimal
 from web3 import Web3
 from web3.exceptions import TransactionNotFound, ContractLogicError, TimeExhausted
 
-# ✅ إصلاح استيراد geth_poa_middleware للإصدارات المختلفة
+# ✅ إصلاح استيراد PoA middleware - محاولة جميع المسارات الممكنة
 try:
+    # web3 v5 - المسار القديم
     from web3.middleware import geth_poa_middleware
 except ImportError:
-    # web3 v6+ 
-    from web3.middleware.geth_poa import geth_poa_middleware
+    try:
+        # web3 v6 - المسار الجديد
+        from web3.middleware.geth_poa import geth_poa_middleware
+    except ImportError:
+        try:
+            # web3 v7+ - مسار مختلف
+            from web3.middleware import GethPoAMiddleware
+            geth_poa_middleware = GethPoAMiddleware
+        except ImportError:
+            # محاولة أخيرة - استيراد من web3.middleware.poa
+            try:
+                from web3.middleware.poa import PoAMiddleware
+                geth_poa_middleware = PoAMiddleware
+            except ImportError:
+                # إذا فشل كل شيء، نعرف دالة بديلة
+                log = logging.getLogger("buyer")
+                log.warning("⚠️ تعذر استيراد PoA middleware، سيتم استخدام دالة بديلة")
+                
+                # دالة بديلة لا تفعل شيئاً
+                def geth_poa_middleware(make_request, web3):
+                    def middleware(method, params):
+                        return make_request(method, params)
+                    return middleware
 
 log = logging.getLogger("buyer")
 
@@ -182,11 +204,20 @@ def get_web3(rpc_url: str) -> Web3:
     """إنشاء اتصال Web3 مع middleware"""
     w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={'timeout': 30}))
     
-    # ✅ إضافة middleware لسلاسل PoA
+    # ✅ إضافة middleware لسلاسل PoA (مع محاولة آمنة)
     try:
-        w3.middleware_onion.inject(geth_poa_middleware, layer=0)
+        # محاولة طرق مختلفة لإضافة middleware
+        if hasattr(w3.middleware_onion, 'inject'):
+            w3.middleware_onion.inject(geth_poa_middleware, layer=0)
+        elif hasattr(w3.middleware_onion, 'add'):
+            w3.middleware_onion.add(geth_poa_middleware)
+        else:
+            # محاولة الطريقة القديمة
+            from web3.middleware import construct_poa_middleware
+            w3.middleware_onion.add(construct_poa_middleware)
     except Exception as e:
         log.warning(f"⚠️ تعذر إضافة PoA middleware: {e}")
+        log.info("ℹ️ قد لا تكون PoA مطلوبة لهذه السلسلة")
     
     if not w3.is_connected():
         raise ConnectionError(f"❌ تعذر الاتصال بـ {rpc_url}")
