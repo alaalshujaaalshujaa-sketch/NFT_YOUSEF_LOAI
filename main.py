@@ -3,8 +3,8 @@
   - يكتشف مينتات اليوم على Robinhood + Ethereum
   - يشتري فقط المينتات المجانية (السعر = 0)
   - يتحقق من وجود حساب X (تويتر) عبر OpenSea API فقط
-  - يستخدم معالجة متوازية للـ APIs لزيادة السرعة
-  - بدون استخدام RPC للحصول على السعر (يعتمد على OpenSea API)
+  - مع تحسينات السرعة: تخزين مؤقت، معالجة متوازية
+  - RPC يبقى كما هو في الكود الأصلي
 """
 
 import asyncio
@@ -14,14 +14,16 @@ import os
 import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
 
 import requests
 import websockets
 from dotenv import load_dotenv
+from web3 import Web3
 
 from buyer import (
+    get_web3,
     attempt_purchase_single_wallet,
+    get_onchain_public_price_wei,
     get_wallet_lock,
 )
 from twitter_checker import get_twitter_username_from_opensea
@@ -56,7 +58,6 @@ ALCHEMY_API_KEY_ETHEREUM = os.environ["ALCHEMY_API_KEY_ETHEREUM"]
 
 STREAM_URL = f"wss://stream.openseabeta.com/socket/websocket?token={OPENSEA_API_KEY}&vsn=2.0.0"
 DROPS_API_BASE = "https://api.opensea.io/api/v2/drops"
-COLLECTIONS_API = "https://api.opensea.io/api/v2/collections"
 
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 LOCAL_TZ = timezone(timedelta(hours=3))
@@ -72,9 +73,6 @@ REJECTION_COOLDOWN_SECONDS = 120
 CACHE_TWITTER_TTL = 300  # 5 دقائق
 CACHE_DETAIL_TTL = 60    # 1 دقيقة
 
-# تجمع مؤشرات الترابط للـ APIs
-executor = ThreadPoolExecutor(max_workers=10)
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -86,21 +84,23 @@ log = logging.getLogger("auto-buyer")
 CHAIN_CONFIGS = {
     "robinhood": {
         "stream_chain_name": "robinhood",
+        "rpc_url": f"https://robinhood-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY_ROBINHOOD}",
         "max_gas_fee_usd": 0.05,
     },
     "ethereum": {
         "stream_chain_name": "ethereum",
+        "rpc_url": f"https://eth-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY_ETHEREUM}",
         "max_gas_fee_usd": 0.50,
     },
 }
 
+W3_INSTANCES = {key: get_web3(cfg["rpc_url"]) for key, cfg in CHAIN_CONFIGS.items()}
 STREAM_NAME_TO_CHAIN_KEY = {cfg["stream_chain_name"]: key for key, cfg in CHAIN_CONFIGS.items()}
 
 # ==================== التخزين المؤقت للسرعة ====================
 cache = {
     "twitter": {},      # slug -> (username, timestamp)
     "detail": {},       # slug -> (detail, timestamp)
-    "price": {},        # slug -> (price_wei, timestamp)
     "eth_price": {"value": None, "ts": 0}
 }
 
@@ -196,23 +196,8 @@ def set_cached_detail(slug: str, detail: dict):
     """تخزين تفاصيل المينت في التخزين المؤقت"""
     cache["detail"][slug] = (detail, time.time())
 
-def get_cached_price(slug: str) -> int | None:
-    """جلب السعر من التخزين المؤقت"""
-    if slug in cache["price"]:
-        price, ts = cache["price"][slug]
-        if time.time() - ts < CACHE_DETAIL_TTL:
-            return price
-        del cache["price"][slug]
-    return None
-
-def set_cached_price(slug: str, price: int):
-    """تخزين السعر في التخزين المؤقت"""
-    cache["price"][slug] = (price, time.time())
-
-# ==================== دوال API السريعة ====================
-
 def fetch_drop_detail_fast(slug: str) -> tuple[bool, dict | None]:
-    """جلب تفاصيل المينت من OpenSea API (سريع)"""
+    """جلب تفاصيل المينت من OpenSea API مع تخزين مؤقت"""
     try:
         # التحقق من التخزين المؤقت أولاً
         cached = get_cached_detail(slug)
@@ -222,7 +207,7 @@ def fetch_drop_detail_fast(slug: str) -> tuple[bool, dict | None]:
         resp = requests.get(
             f"{DROPS_API_BASE}/{slug}",
             headers={"x-api-key": OPENSEA_API_KEY},
-            timeout=5,  # تقليل timeout للسرعة
+            timeout=5,
         )
         if resp.status_code == 200:
             data = resp.json()
@@ -235,87 +220,21 @@ def fetch_drop_detail_fast(slug: str) -> tuple[bool, dict | None]:
         log.warning(f"⚠️ [Drops API] خطأ: {e}")
         return None, None
 
-def fetch_price_fast(slug: str, detail: dict) -> int:
-    """جلب السعر من تفاصيل المينت (بدون RPC)"""
-    try:
-        # التحقق من التخزين المؤقت
-        cached = get_cached_price(slug)
-        if cached is not None:
-            return cached
-            
-        # جلب السعر من تفاصيل المينت (بدون RPC)
-        stage = detail.get("active_stage", {})
-        price_str = stage.get("price", "0")
-        price_wei = int(price_str) if price_str else 0
-        
-        set_cached_price(slug, price_wei)
-        return price_wei
-    except Exception as e:
-        log.warning(f"⚠️ [السعر] خطأ: {e}")
-        return 0
-
 def fetch_twitter_fast(slug: str) -> str | None:
-    """جلب حساب تويتر من OpenSea API (سريع)"""
+    """جلب حساب تويتر من OpenSea API مع تخزين مؤقت"""
     try:
         # التحقق من التخزين المؤقت
         cached = get_cached_twitter(slug)
         if cached is not None:
             return cached if cached else None
             
-        url = f"{COLLECTIONS_API}/{slug}"
-        headers = {"x-api-key": OPENSEA_API_KEY}
-        
-        response = requests.get(url, headers=headers, timeout=5)  # تقليل timeout
-        
-        if response.status_code == 200:
-            data = response.json()
-            
-            # البحث في social_links
-            social_links = data.get('social_links', [])
-            for link in social_links:
-                if isinstance(link, dict):
-                    url_lower = link.get('url', '').lower()
-                    if 'twitter.com' in url_lower or 'x.com' in url_lower:
-                        username = link.get('username')
-                        if username:
-                            set_cached_twitter(slug, username)
-                            return username
-            
-            # البحث المباشر
-            twitter_username = data.get('twitter_username')
-            if twitter_username:
-                set_cached_twitter(slug, twitter_username)
-                return twitter_username
-            
-            # البحث في project_details
-            project_details = data.get('project_details', {})
-            if isinstance(project_details, dict):
-                twitter_username = project_details.get('twitter_username')
-                if twitter_username:
-                    set_cached_twitter(slug, twitter_username)
-                    return twitter_username
-            
-            set_cached_twitter(slug, None)
-            return None
-            
+        # استخدام الدالة من twitter_checker
+        username = get_twitter_username_from_opensea(slug, OPENSEA_API_KEY)
+        set_cached_twitter(slug, username)
+        return username
     except Exception as e:
         log.debug(f"⚠️ خطأ في جلب تويتر: {e}")
         return None
-
-def fetch_all_data_parallel(slug: str) -> tuple[dict | None, int, str | None]:
-    """جلب جميع البيانات بالتوازي لزيادة السرعة"""
-    # جلب التفاصيل أولاً (لأنها تحتوي على السعر)
-    found, detail = fetch_drop_detail_fast(slug)
-    if not found or not detail:
-        return None, 0, None
-    
-    # جلب السعر من التفاصيل (بدون RPC)
-    price_wei = fetch_price_fast(slug, detail)
-    
-    # جلب تويتر (قد يكون في التخزين المؤقت)
-    twitter_username = fetch_twitter_fast(slug)
-    
-    return detail, price_wei, twitter_username
 
 # ==================== دوال مساعدة أخرى ====================
 
@@ -377,7 +296,7 @@ async def telegram_sender():
         except Exception as e:
             log.error(f"❌ خطأ إرسال تليجرام: {e}")
         send_queue.task_done()
-        await asyncio.sleep(0.05)  # أسرع
+        await asyncio.sleep(0.05)
 
 # ==================== دوال بناء الرسائل ====================
 
@@ -419,10 +338,10 @@ def build_gaveup_message(detail: dict, reason: str) -> str:
     name = detail.get("collection_name") or detail.get("collection_slug")
     return f"❌ <b>انتهت الفرصة</b>\n\nالمجموعة: <b>{name}</b>\nالسبب: {reason}"
 
-# ==================== الشراء المتوازي ====================
+# ==================== الشراء المتوازي (مع RPC كما هو) ====================
 
 async def purchase_task_for_wallet(
-    item, slug, contract_address, price_wei, max_per_wallet, remaining, eth_price_usd, max_gas_fee_usd
+    w3, item, slug, contract_address, price_wei, max_per_wallet, remaining, eth_price_usd, max_gas_fee_usd
 ):
     """مهمة الشراء لمحفظة واحدة"""
     wallet_addr = item["wallet"]
@@ -436,10 +355,10 @@ async def purchase_task_for_wallet(
         if wallet_addr in successful_mints.get(slug, set()):
             return {"success": False, "wallet": wallet_addr, "reason": "already_bought"}
 
-        # محاولة الشراء (بدون RPC - نمرر السعر مباشرة)
+        # محاولة الشراء (مع RPC كما هو في الكود الأصلي)
         res = await asyncio.to_thread(
             attempt_purchase_single_wallet,
-            pk, wallet_addr,
+            w3, pk, wallet_addr,
             contract_address, price_wei, max_per_wallet, remaining,
             eth_price_usd, max_gas_fee_usd,
         )
@@ -478,10 +397,12 @@ async def try_buy_now_multi_wallet(slug: str, chain_key: str, detail: dict) -> l
     if not contract_address:
         return [{"success": False, "reason": "no_contract_address"}]
 
+    w3 = W3_INSTANCES[chain_key]
     eth_price_usd = get_eth_price_usd()
 
-    # جلب السعر من التفاصيل (بدون RPC)
-    price_wei = fetch_price_fast(slug, detail)
+    # ✅ RPC موجود هنا كما في الكود الأصلي
+    onchain_price = await asyncio.to_thread(get_onchain_public_price_wei, w3, contract_address)
+    price_wei = onchain_price if onchain_price is not None else int(stage.get("price", "0"))
 
     # ✅ التأكد من أن المينت مجاني
     if not is_free_mint(price_wei, eth_price_usd):
@@ -510,7 +431,7 @@ async def try_buy_now_multi_wallet(slug: str, chain_key: str, detail: dict) -> l
     # تنفيذ الشراء بالتوازي
     tasks = [
         purchase_task_for_wallet(
-            item, slug, contract_address,
+            w3, item, slug, contract_address,
             price_wei, max_per_wallet, remaining, eth_price_usd, max_gas_fee_usd
         )
         for item in pending_items
@@ -531,7 +452,7 @@ async def try_buy_now_multi_wallet(slug: str, chain_key: str, detail: dict) -> l
 # ==================== تقييم المينتات (محسن للسرعة) ====================
 
 async def evaluate_new_mint(slug: str, chain_key: str):
-    """تقييم المينت الجديد - سريع مع تخزين مؤقت"""
+    """تقييم المينت الجديد - مع RPC كما هو مع تحسينات السرعة"""
     
     # التحقق من الشروط المسبقة (سريع)
     if (len(successful_mints.get(slug, set())) >= len(WALLETS_DATA) or
@@ -540,25 +461,30 @@ async def evaluate_new_mint(slug: str, chain_key: str):
 
     in_flight.add(slug)
     try:
-        # ✅ جلب جميع البيانات بالتوازي (سريع)
-        detail, price_wei, twitter_username = await asyncio.to_thread(
-            fetch_all_data_parallel, slug
-        )
-        
-        if not detail:
-            return
-
-        # التحقق من أن المينت نشط (سريع)
-        if not detail.get("is_minting"):
+        # ✅ جلب تفاصيل المينت (مع تخزين مؤقت)
+        found, detail = await asyncio.to_thread(fetch_drop_detail_fast, slug)
+        if not found or not detail or not detail.get("is_minting"):
             return
 
         stage = detail.get("active_stage")
         if not stage or not started_today_local(stage):
             return
 
-        # ✅ التحقق من السعر (بدون RPC)
+        # ✅ جلب السعر (RPC موجود هنا كما في الكود الأصلي)
+        w3 = W3_INSTANCES[chain_key]
         eth_price_usd = get_eth_price_usd()
+        contract_address = detail.get("contract_address")
         
+        if not contract_address:
+            log.info(f"⏭️ '{slug}': لا يوجد عنوان عقد")
+            mark_rejected(slug)
+            return
+        
+        # ✅ RPC كما هو في الكود الأصلي
+        onchain_price = await asyncio.to_thread(get_onchain_public_price_wei, w3, contract_address)
+        price_wei = onchain_price if onchain_price is not None else int(stage.get("price", "0"))
+        
+        # ✅ التحقق من السعر المجاني
         if not is_free_mint(price_wei, eth_price_usd):
             price_usd = (price_wei / 1e18) * eth_price_usd
             log.info(f"⏭️ '{slug}' مدفوع (${price_usd:.4f}) — يتم تجاهله (نشتري مجاني فقط)")
@@ -567,7 +493,9 @@ async def evaluate_new_mint(slug: str, chain_key: str):
 
         log.info(f"💰 '{slug}' مينت مجاني! جاري التحقق من تويتر...")
 
-        # ✅ التحقق من تويتر (من التخزين المؤقت)
+        # ✅ جلب تويتر (مع تخزين مؤقت)
+        twitter_username = await asyncio.to_thread(fetch_twitter_fast, slug)
+        
         if not twitter_username:
             log.info(f"⏭️ '{slug}': لا يوجد حساب X مربوط — يتم تجاهله")
             mark_rejected(slug)
@@ -735,7 +663,7 @@ async def run():
     # إرسال رسالة التشغيل
     broadcast_message(f"✅ تم تشغيل البوت بنجاح!")
     broadcast_message(f"💰 النظام يشتري فقط المينتات المجانية مع حساب X")
-    broadcast_message(f"⚡ وضع السرعة: بدون RPC، مع تخزين مؤقت")
+    broadcast_message(f"⚡ مع تحسينات السرعة: تخزين مؤقت + معالجة متوازية")
     
     # تشغيل المهام المتوازية
     await asyncio.gather(
