@@ -14,7 +14,13 @@ from decimal import Decimal
 
 from web3 import Web3
 from web3.exceptions import TransactionNotFound, ContractLogicError, TimeExhausted
-from web3.middleware import geth_poa_middleware
+
+# ✅ إصلاح استيراد geth_poa_middleware للإصدارات المختلفة
+try:
+    from web3.middleware import geth_poa_middleware
+except ImportError:
+    # web3 v6+ 
+    from web3.middleware.geth_poa import geth_poa_middleware
 
 log = logging.getLogger("buyer")
 
@@ -69,8 +75,8 @@ LIMITED_BUY_QTY = 15
 GAS_LIMIT_SAFETY_MARGIN = 1.2
 MAX_RETRY_DELAY = 10
 RETRY_BACKOFF_FACTOR = 1.5
-MAX_PENDING_TX = 3  # الحد الأقصى للمعاملات المعلقة لكل محفظة
-GAS_PRICE_MULTIPLIER = 1.1  # مضاعف سعر الغاز للتنافسية
+MAX_PENDING_TX = 3
+GAS_PRICE_MULTIPLIER = 1.1
 
 # ==================== استراتيجيات الشراء ====================
 class PurchaseStrategy(Enum):
@@ -140,7 +146,6 @@ class WalletLockManager:
         self._lock_creation: asyncio.Lock = asyncio.Lock()
     
     async def get_lock(self, wallet_address: str) -> asyncio.Lock:
-        """الحصول على قفل المحفظة"""
         addr = wallet_address.lower()
         async with self._lock_creation:
             if addr not in self._locks:
@@ -153,32 +158,22 @@ lock_manager = WalletLockManager()
 class PendingTxManager:
     """مدير المعاملات المعلقة"""
     def __init__(self):
-        self._pending: Dict[str, List[str]] = {}  # wallet -> [tx_hashes]
+        self._pending: Dict[str, List[str]] = {}
     
     async def add_tx(self, wallet: str, tx_hash: str):
-        """إضافة معاملة معلقة"""
         addr = wallet.lower()
         if addr not in self._pending:
             self._pending[addr] = []
         self._pending[addr].append(tx_hash)
     
     async def remove_tx(self, wallet: str, tx_hash: str):
-        """إزالة معاملة معلقة"""
         addr = wallet.lower()
         if addr in self._pending and tx_hash in self._pending[addr]:
             self._pending[addr].remove(tx_hash)
     
     async def get_pending_count(self, wallet: str) -> int:
-        """الحصول على عدد المعاملات المعلقة"""
         addr = wallet.lower()
         return len(self._pending.get(addr, []))
-    
-    async def clear_stale_txs(self, max_age_seconds: int = 300):
-        """تنظيف المعاملات القديمة"""
-        current_time = time.time()
-        for wallet in self._pending:
-            # هنا يمكن إضافة منطق للتحقق من عمر المعاملات
-            pass
 
 pending_manager = PendingTxManager()
 
@@ -187,16 +182,15 @@ def get_web3(rpc_url: str) -> Web3:
     """إنشاء اتصال Web3 مع middleware"""
     w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={'timeout': 30}))
     
-    # إضافة middleware لسلاسل PoA إذا لزم الأمر
+    # ✅ إضافة middleware لسلاسل PoA
     try:
         w3.middleware_onion.inject(geth_poa_middleware, layer=0)
-    except:
-        pass
+    except Exception as e:
+        log.warning(f"⚠️ تعذر إضافة PoA middleware: {e}")
     
     if not w3.is_connected():
         raise ConnectionError(f"❌ تعذر الاتصال بـ {rpc_url}")
     
-    # التحقق من دعم EIP-1559
     try:
         latest_block = w3.eth.get_block('latest')
         if 'baseFeePerGas' in latest_block:
@@ -209,7 +203,6 @@ def get_web3(rpc_url: str) -> Web3:
     return w3
 
 async def get_wallet_balance_usd(w3: Web3, wallet_address: str, eth_price_usd: float) -> float:
-    """جلب رصيد المحفظة بالدولار (async)"""
     try:
         checksum_wallet = Web3.to_checksum_address(wallet_address)
         balance_wei = await asyncio.to_thread(w3.eth.get_balance, checksum_wallet)
@@ -224,18 +217,15 @@ async def estimate_gas_fee_usd(
     gas_units: int = 150_000,
     priority_fee_multiplier: float = 1.0
 ) -> float:
-    """تقدير رسوم الغاز بالدولار مع دعم EIP-1559"""
     try:
         latest_block = await asyncio.to_thread(w3.eth.get_block, 'pending')
         
         if 'baseFeePerGas' in latest_block:
-            # EIP-1559
             base_fee = latest_block['baseFeePerGas']
             priority_fee = await asyncio.to_thread(w3.eth.max_priority_fee)
             priority_fee = int(priority_fee * priority_fee_multiplier)
             total_fee_per_gas = base_fee + priority_fee
         else:
-            # Legacy
             gas_price = await asyncio.to_thread(w3.eth.gas_price)
             total_fee_per_gas = int(gas_price * GAS_PRICE_MULTIPLIER)
         
@@ -250,7 +240,6 @@ async def get_optimal_gas_params(
     priority_fee_multiplier: float = 1.0,
     max_gas_multiplier: float = 1.5
 ) -> Dict[str, Any]:
-    """الحصول على معاملات الغاز المثلى"""
     try:
         latest_block = await asyncio.to_thread(w3.eth.get_block, 'pending')
         
@@ -261,14 +250,14 @@ async def get_optimal_gas_params(
             max_fee = int(base_fee * max_gas_multiplier + priority_fee)
             
             return {
-                'type': 2,  # EIP-1559
+                'type': 2,
                 'maxFeePerGas': max_fee,
                 'maxPriorityFeePerGas': priority_fee,
             }
         else:
             gas_price = await asyncio.to_thread(w3.eth.gas_price)
             return {
-                'type': 0,  # Legacy
+                'type': 0,
                 'gasPrice': int(gas_price * GAS_PRICE_MULTIPLIER),
             }
     except Exception as e:
@@ -277,7 +266,6 @@ async def get_optimal_gas_params(
         return {'type': 0, 'gasPrice': gas_price}
 
 async def get_fee_recipient(w3: Web3, nft_contract: str) -> Optional[str]:
-    """جلب مستلم الرسوم من العقد"""
     try:
         seadrop = w3.eth.contract(address=SEADROP_ADDRESS, abi=SEADROP_ABI)
         recipients = await asyncio.to_thread(
@@ -293,7 +281,6 @@ async def get_fee_recipient(w3: Web3, nft_contract: str) -> Optional[str]:
         return None
 
 async def get_onchain_public_price_wei(w3: Web3, nft_contract: str) -> Optional[int]:
-    """جلب السعر العام من العقد"""
     try:
         seadrop = w3.eth.contract(address=SEADROP_ADDRESS, abi=SEADROP_ABI)
         public_drop = await asyncio.to_thread(
@@ -307,7 +294,6 @@ async def get_onchain_public_price_wei(w3: Web3, nft_contract: str) -> Optional[
         return None
 
 def decide_quantity(max_per_wallet: Optional[int], remaining_supply: int, strategy: PurchaseStrategy) -> int:
-    """تحديد الكمية المناسبة للشراء حسب الاستراتيجية"""
     if max_per_wallet is None:
         base_qty = 5
     elif max_per_wallet <= FEW_THRESHOLD:
@@ -315,13 +301,12 @@ def decide_quantity(max_per_wallet: Optional[int], remaining_supply: int, strate
     else:
         base_qty = LIMITED_BUY_QTY
     
-    # تعديل حسب الاستراتيجية
     if strategy == PurchaseStrategy.AGGRESSIVE:
-        qty = base_qty  # شراء الحد الأقصى
+        qty = base_qty
     elif strategy == PurchaseStrategy.CONSERVATIVE:
-        qty = max(1, base_qty // 2)  # شراء نصف الكمية
-    else:  # BALANCED
-        qty = max(1, int(base_qty * 0.75))  # شراء 75%
+        qty = max(1, base_qty // 2)
+    else:
+        qty = max(1, int(base_qty * 0.75))
     
     return max(1, min(qty, remaining_supply))
 
@@ -336,15 +321,11 @@ async def send_transaction_with_retry(
     eth_price_usd: float,
     max_gas_fee_usd: float,
 ) -> PurchaseResult:
-    """
-    محاولة الشراء بمحفظة واحدة مع إعادة المحاولة الذكية
-    """
     strategy_config = STRATEGY_CONFIGS[wallet_data.strategy]
     max_retries = strategy_config["max_retries"]
     
     for attempt in range(max_retries):
         try:
-            # تحديث الإحصائيات
             wallet_data.stats["total_attempts"] += 1
             
             result = await _attempt_purchase(
@@ -367,7 +348,6 @@ async def send_transaction_with_retry(
             else:
                 wallet_data.stats["failed"] += 1
                 
-                # التحقق من إمكانية إعادة المحاولة
                 if result.reason in ["timeout", "connection_error", "nonce_error", "underpriced"]:
                     if attempt < max_retries - 1:
                         delay = min(
@@ -384,7 +364,6 @@ async def send_transaction_with_retry(
                 return result
                 
         except Exception as e:
-            error_msg = str(e).lower()
             log.error(f"❌ المحفظة {wallet_data.wallet[:8]} - خطأ غير متوقع: {e}")
             
             if attempt < max_retries - 1:
@@ -417,12 +396,9 @@ async def _attempt_purchase(
     max_gas_fee_usd: float,
     strategy_config: Dict[str, Any],
 ) -> PurchaseResult:
-    """محاولة الشراء الفعلية مع جميع الفحوصات"""
-    
     checksum_wallet = Web3.to_checksum_address(wallet_data.wallet)
     checksum_contract = Web3.to_checksum_address(nft_contract)
     
-    # 1. التحقق من عدد المعاملات المعلقة
     pending_count = await pending_manager.get_pending_count(checksum_wallet)
     if pending_count >= MAX_PENDING_TX:
         return PurchaseResult(
@@ -431,7 +407,6 @@ async def _attempt_purchase(
             reason="too_many_pending_tx"
         )
     
-    # 2. التحقق من الرصيد
     balance_usd = await get_wallet_balance_usd(w3, checksum_wallet, eth_price_usd)
     if balance_usd < MIN_BALANCE_RESERVE_USD:
         return PurchaseResult(
@@ -441,7 +416,6 @@ async def _attempt_purchase(
             error=f"Balance: ${balance_usd:.2f}"
         )
     
-    # 3. تقدير رسوم الغاز
     gas_fee_usd = await estimate_gas_fee_usd(
         w3, 
         eth_price_usd,
@@ -456,7 +430,6 @@ async def _attempt_purchase(
             error=f"Gas: ${gas_fee_usd:.4f} > Max: ${max_gas_fee_usd:.4f}"
         )
     
-    # 4. جلب مستلم الرسوم
     fee_recipient = await get_fee_recipient(w3, checksum_contract)
     if not fee_recipient:
         return PurchaseResult(
@@ -465,12 +438,10 @@ async def _attempt_purchase(
             reason="no_fee_recipient"
         )
     
-    # 5. تحديد الكمية
     quantity = decide_quantity(max_per_wallet, remaining_supply, wallet_data.strategy)
     total_value = price_wei_per_token * quantity
     
     try:
-        # 6. بناء المعاملة
         contract = w3.eth.contract(address=SEADROP_ADDRESS, abi=SEADROP_ABI)
         nonce = await asyncio.to_thread(
             w3.eth.get_transaction_count,
@@ -478,7 +449,6 @@ async def _attempt_purchase(
             "pending"
         )
         
-        # الحصول على معاملات الغاز المثلى
         gas_params = await get_optimal_gas_params(
             w3,
             priority_fee_multiplier=strategy_config["priority_fee_multiplier"],
@@ -498,7 +468,6 @@ async def _attempt_purchase(
             **gas_params,
         })
         
-        # 7. تقدير الغاز
         try:
             estimated_gas = await asyncio.to_thread(w3.eth.estimate_gas, tx)
             tx["gas"] = int(estimated_gas * GAS_LIMIT_SAFETY_MARGIN)
@@ -517,10 +486,9 @@ async def _attempt_purchase(
                 error=str(e)
             )
         
-        # 8. التحقق النهائي من التكلفة
-        if gas_params.get('type') == 2:  # EIP-1559
+        if gas_params.get('type') == 2:
             gas_cost_wei = tx["gas"] * gas_params["maxFeePerGas"]
-        else:  # Legacy
+        else:
             gas_cost_wei = tx["gas"] * gas_params["gasPrice"]
         
         actual_gas_fee_usd = (gas_cost_wei / 1e18) * eth_price_usd
@@ -533,7 +501,6 @@ async def _attempt_purchase(
                 error=f"Actual gas: ${actual_gas_fee_usd:.4f}"
             )
         
-        # 9. التحقق من الرصيد الكافي
         total_cost_wei = total_value + gas_cost_wei
         wallet_balance_wei = await asyncio.to_thread(w3.eth.get_balance, checksum_wallet)
         if wallet_balance_wei < total_cost_wei:
@@ -544,14 +511,12 @@ async def _attempt_purchase(
                 error=f"Need: {total_cost_wei/1e18:.6f} ETH, Have: {wallet_balance_wei/1e18:.6f} ETH"
             )
         
-        # 10. توقيع وإرسال المعاملة
         signed = w3.eth.account.sign_transaction(tx, private_key=wallet_data.private_key)
         tx_hash = await asyncio.to_thread(
             w3.eth.send_raw_transaction,
             signed.raw_transaction
         )
         
-        # إضافة للمعاملات المعلقة
         await pending_manager.add_tx(checksum_wallet, tx_hash.hex())
         wallet_data.pending_tx_count += 1
         
@@ -562,7 +527,6 @@ async def _attempt_purchase(
             f"Gas: ${actual_gas_fee_usd:.4f}"
         )
         
-        # 11. انتظار التأكيد (اختياري)
         try:
             receipt = await asyncio.wait_for(
                 asyncio.to_thread(
@@ -573,7 +537,6 @@ async def _attempt_purchase(
                 timeout=130
             )
             
-            # إزالة من المعاملات المعلقة
             await pending_manager.remove_tx(checksum_wallet, tx_hash.hex())
             wallet_data.pending_tx_count -= 1
             
@@ -587,8 +550,6 @@ async def _attempt_purchase(
                 )
         except asyncio.TimeoutError:
             log.warning(f"⚠️ لم يتم تأكيد المعاملة {tx_hash.hex()[:10]}... خلال 120 ثانية")
-            # نعتبرها ناجحة مؤقتاً، سنتحقق لاحقاً
-            # إزالة من المعاملات المعلقة بعد فترة
             asyncio.create_task(_cleanup_pending_tx(w3, checksum_wallet, tx_hash.hex()))
         
         return PurchaseResult(
@@ -604,7 +565,6 @@ async def _attempt_purchase(
         error_msg = str(e)
         log.error(f"❌ [خطأ إرسال للمحفظة {checksum_wallet[:8]}] {error_msg}")
         
-        # تصنيف الخطأ
         error_lower = error_msg.lower()
         if "nonce" in error_lower:
             reason = "nonce_error"
@@ -627,15 +587,13 @@ async def _attempt_purchase(
         )
 
 async def _cleanup_pending_tx(w3: Web3, wallet: str, tx_hash: str):
-    """تنظيف المعاملات المعلقة بعد فترة"""
-    await asyncio.sleep(300)  # 5 دقائق
+    await asyncio.sleep(300)
     try:
         receipt = await asyncio.to_thread(w3.eth.get_transaction_receipt, tx_hash)
         if receipt:
             await pending_manager.remove_tx(wallet, tx_hash)
             log.info(f"✅ تم تأكيد المعاملة المتأخرة: {tx_hash[:10]}...")
     except:
-        # المعاملة ما زالت معلقة، نتركها
         pass
 
 # ==================== الشراء المتوازي المحسن ====================
@@ -649,9 +607,6 @@ async def purchase_parallel(
     eth_price_usd: float,
     max_gas_fee_usd: float,
 ) -> List[PurchaseResult]:
-    """
-    شراء متوازي لجميع المحافظ مع إدارة الأخطاء
-    """
     tasks = []
     for wallet_data in wallets_data:
         lock = await lock_manager.get_lock(wallet_data.wallet)
@@ -671,10 +626,8 @@ async def purchase_parallel(
         
         tasks.append(purchase_with_lock())
     
-    # تنفيذ جميع المهام بالتوازي
     results = await asyncio.gather(*tasks, return_exceptions=True)
     
-    # معالجة النتائج
     processed_results = []
     for i, result in enumerate(results):
         if isinstance(result, Exception):
@@ -691,7 +644,6 @@ async def purchase_parallel(
 
 # ==================== أدوات تحليلية ====================
 def get_wallet_stats(wallet_data: WalletData) -> Dict[str, Any]:
-    """الحصول على إحصائيات المحفظة"""
     stats = wallet_data.stats.copy()
     total = stats["total_attempts"]
     if total > 0:
@@ -701,7 +653,6 @@ def get_wallet_stats(wallet_data: WalletData) -> Dict[str, Any]:
     return stats
 
 def format_wallet_stats(wallet_data: WalletData) -> str:
-    """تنسيق إحصائيات المحفظة للعرض"""
     stats = get_wallet_stats(wallet_data)
     return (
         f"📊 <b>إحصائيات المحفظة</b>\n"
