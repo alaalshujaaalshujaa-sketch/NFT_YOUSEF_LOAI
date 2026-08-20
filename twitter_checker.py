@@ -1,64 +1,141 @@
-import os
+"""
+التحقق من وجود حساب X (تويتر) عبر OpenSea API فقط
+"""
+
 import logging
 import requests
+from typing import Optional
 
-log = logging.getLogger("twitter-verifier")
+log = logging.getLogger("twitter_checker")
 
-def get_twitter_username_from_opensea(slug: str, opensea_api_key: str) -> str | None:
+def get_twitter_username_from_opensea(slug: str, api_key: str) -> Optional[str]:
+    """
+    جلب اسم المستخدم في X (تويتر) من OpenSea API
+    
+    Args:
+        slug: معرف المجموعة في OpenSea
+        api_key: مفتاح API الخاص بـ OpenSea
+    
+    Returns:
+        اسم المستخدم في X أو None إذا لم يكن موجوداً
+    """
     try:
+        # جلب تفاصيل المجموعة من OpenSea
         url = f"https://api.opensea.io/api/v2/collections/{slug}"
-        headers = {"x-api-key": opensea_api_key}
-        resp = requests.get(url, headers=headers, timeout=5)
-        if resp.status_code == 200:
-            return resp.json().get("twitter_username")
+        headers = {
+            "x-api-key": api_key,
+            "accept": "application/json"
+        }
+        
+        log.info(f"🔍 جاري البحث عن حساب X للمجموعة: {slug}")
+        response = requests.get(url, headers=headers, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            
+            # البحث عن حسابات التواصل الاجتماعي
+            social_links = data.get('social_links', [])
+            
+            # البحث عن رابط X (تويتر)
+            for link in social_links:
+                url_lower = link.get('url', '').lower()
+                if 'twitter.com' in url_lower or 'x.com' in url_lower:
+                    username = link.get('username')
+                    if username:
+                        log.info(f"✅ تم العثور على حساب X: @{username} للمجموعة {slug}")
+                        return username
+            
+            # محاولة بديلة: البحث في data مباشرة
+            twitter_username = data.get('twitter_username')
+            if twitter_username:
+                log.info(f"✅ تم العثور على حساب X: @{twitter_username} للمجموعة {slug}")
+                return twitter_username
+            
+            # محاولة ثالثة: البحث في project details
+            project_details = data.get('project_details', {})
+            twitter_username = project_details.get('twitter_username')
+            if twitter_username:
+                log.info(f"✅ تم العثور على حساب X: @{twitter_username} للمجموعة {slug}")
+                return twitter_username
+            
+            log.warning(f"⚠️ لا يوجد حساب X للمجموعة {slug}")
+            return None
+            
+        elif response.status_code == 404:
+            log.warning(f"⚠️ المجموعة {slug} غير موجودة في OpenSea")
+            return None
         else:
-            log.warning(f"[OpenSea Collections API] HTTP {resp.status_code} عند جلب '{slug}': {resp.text[:200]}")
+            log.warning(f"⚠️ استجابة غير متوقعة من OpenSea: {response.status_code}")
+            return None
+            
+    except requests.exceptions.Timeout:
+        log.error(f"❌ انتهى الوقت في جلب بيانات المجموعة {slug}")
+        return None
+    except requests.exceptions.ConnectionError:
+        log.error(f"❌ خطأ في الاتصال بـ OpenSea للمجموعة {slug}")
+        return None
     except Exception as e:
-        log.warning(f"[Twitter Check] تعذر جلب معلومات المجموعة لـ {slug}: {e}")
+        log.error(f"❌ خطأ في جلب حساب X للمجموعة {slug}: {e}")
+        return None
+
+# دالة بديلة تستخدم Drops API إذا فشلت الطريقة الأولى
+def get_twitter_from_drops_api(slug: str, api_key: str) -> Optional[str]:
+    """
+    محاولة جلب حساب X من Drops API كطريقة احتياطية
+    """
+    try:
+        url = f"https://api.opensea.io/api/v2/drops/{slug}"
+        headers = {
+            "x-api-key": api_key,
+            "accept": "application/json"
+        }
+        
+        response = requests.get(url, headers=headers, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            
+            # البحث في بيانات المينت
+            collection = data.get('collection', {})
+            social_links = collection.get('social_links', [])
+            
+            for link in social_links:
+                url_lower = link.get('url', '').lower()
+                if 'twitter.com' in url_lower or 'x.com' in url_lower:
+                    username = link.get('username')
+                    if username:
+                        log.info(f"✅ (Drops API) تم العثور على حساب X: @{username} للمجموعة {slug}")
+                        return username
+            
+            # محاولة استخراج من البيانات المباشرة
+            twitter_username = data.get('twitter_username')
+            if twitter_username:
+                log.info(f"✅ (Drops API) تم العثور على حساب X: @{twitter_username} للمجموعة {slug}")
+                return twitter_username
+                
+        return None
+    except Exception as e:
+        log.debug(f"⚠️ فشل Drops API لـ {slug}: {e}")
+        return None
+
+# الدالة الرئيسية مع Fallback
+def get_twitter_username_from_opensea_with_fallback(slug: str, api_key: str) -> Optional[str]:
+    """
+    محاولة جلب اسم المستخدم في X باستخدام طرق متعددة
+    """
+    # المحاولة الأولى: Collections API
+    username = get_twitter_username_from_opensea(slug, api_key)
+    if username:
+        return username
+    
+    # المحاولة الثانية: Drops API
+    username = get_twitter_from_drops_api(slug, api_key)
+    if username:
+        return username
+    
+    # إذا لم يتم العثور على حساب
+    log.info(f"❌ لم يتم العثور على حساب X للمجموعة {slug}")
     return None
 
-def is_valid_twitter_account(username: str) -> bool:
-    bearer_token = os.environ.get("TWITTER_BEARER_TOKEN")
-    if not username:
-        return False
-    if not bearer_token:
-        log.error("[X API] TWITTER_BEARER_TOKEN غير مضبوط في متغيرات البيئة — سيتم رفض كل الحسابات.")
-        return False
-
-    try:
-        url = f"https://api.x.com/2/users/by/username/{username}?user.fields=verified,public_metrics"
-        headers = {"Authorization": f"Bearer {bearer_token}"}
-        resp = requests.get(url, headers=headers, timeout=5)
-
-        if resp.status_code == 200:
-            user_data = resp.json().get("data", {})
-            metrics = user_data.get("public_metrics", {})
-
-            is_verified = user_data.get("verified", False)
-            followers_count = metrics.get("followers_count", 0)
-
-            if is_verified or followers_count >= 100:
-                log.info(f"✅ حساب X موثوق: @{username} (متابعين: {followers_count})")
-                return True
-            else:
-                log.info(f"⚠️ حساب X ضعيف فعليًا: @{username} (متابعين: {followers_count})")
-                return False
-
-        elif resp.status_code == 429:
-            log.error(f"[X API] تجاوزت حد الطلبات (429) عند فحص @{username} — لن نعتبره مرفوضًا بشكل نهائي.")
-            return False
-        elif resp.status_code in (401, 403):
-            log.error(
-                f"[X API] فشل مصادقة/صلاحية (HTTP {resp.status_code}) عند فحص @{username}: "
-                f"{resp.text[:300]} — تحقق من أن TWITTER_BEARER_TOKEN صالح وأن الـ App "
-                f"مربوط بمشروع (Project) على خطة تدعم قراءة بيانات المستخدمين."
-            )
-            return False
-        else:
-            log.error(f"[X API] استجابة غير متوقعة (HTTP {resp.status_code}) عند فحص @{username}: {resp.text[:300]}")
-            return False
-
-    except Exception as e:
-        log.error(f"[X API Error] خطأ أثناء التحقق من حساب @{username}: {e}")
-
-    return False
+# تصدير الدالة الرئيسية (للتوافق مع main.py)
+get_twitter_username_from_opensea = get_twitter_username_from_opensea_with_fallback
