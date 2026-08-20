@@ -390,7 +390,9 @@ async def get_mint_times(w3: Web3, nft_contract: str) -> Tuple[Optional[int], Op
             ),
             timeout=10
         )
-        return int(public_drop[1]), int(public_drop[2])
+        if public_drop and len(public_drop) > 2:
+            return int(public_drop[1]), int(public_drop[2])
+        return None, None
         
     except Exception as e:
         log.warning(f"⚠️ [وقت المينت] تعذر القراءة: {e}")
