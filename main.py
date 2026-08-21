@@ -10,6 +10,7 @@
 - إحصائيات أداء البوت
 - إشعارات حالة البوت الدورية (كل ساعة)
 - إشعار عند بدء التشغيل
+- فحص دوري للمينتات النشطة (كل دقيقة)
 """
 
 import asyncio
@@ -178,8 +179,6 @@ def update_stats(stat_name: str, value=1):
     if stat_name in bot_stats:
         if isinstance(bot_stats[stat_name], (int, float)):
             bot_stats[stat_name] += value
-    elif stat_name in bot_stats:
-        bot_stats[stat_name] = value
 
 def get_uptime() -> str:
     """الحصول على وقت التشغيل بصيغة مقروءة"""
@@ -690,10 +689,115 @@ async def status_reporter():
         
         # إرسال تقرير كل ساعة (3600 ثانية)
         if time.time() - last_report >= 3600:
-            if bot_stats["mints_purchased"] > 0 or len(paid_mints_tracking) > 0:
-                broadcast_message(build_status_message())
-                log.info("📊 تم إرسال تقرير الحالة")
+            broadcast_message(build_status_message())
+            log.info("📊 تم إرسال تقرير الحالة")
             last_report = time.time()
+
+# ---------------------------------------------------------------------------
+# فحص دوري للمينتات النشطة (كل دقيقة)
+# ---------------------------------------------------------------------------
+
+async def manual_scan():
+    """فحص يدوي للمينتات النشطة وعرضها في السجلات"""
+    while True:
+        try:
+            await asyncio.sleep(60)  # كل دقيقة
+            
+            log.info("🔍 [فحص دوري] جاري فحص المينتات النشطة...")
+            
+            # جلب المينتات النشطة
+            url = f"{DROPS_API_BASE}?limit=30"
+            headers = {"x-api-key": OPENSEA_API_KEY}
+            resp = requests.get(url, headers=headers, timeout=10)
+            
+            if resp.status_code != 200:
+                log.warning(f"⚠️ فشل جلب المينتات: {resp.status_code}")
+                continue
+            
+            data = resp.json()
+            drops = data.get("drops", [])
+            
+            if not drops:
+                log.info("📭 لا توجد مينتات نشطة حالياً")
+                continue
+            
+            total_mints = len(drops)
+            free_mints = 0
+            paid_mints = 0
+            today_mints = 0
+            
+            log.info(f"📊 تم العثور على {total_mints} مينت نشط")
+            
+            # عرض تفاصيل كل مينت
+            for drop in drops[:10]:  # عرض أول 10 فقط
+                slug = drop.get("slug")
+                name = drop.get("collection_name") or slug
+                stage = drop.get("active_stage", {})
+                
+                if not stage:
+                    continue
+                
+                # التحقق من تاريخ المينت
+                if not started_today_local(stage):
+                    continue
+                
+                today_mints += 1
+                
+                # جلب السعر
+                price_str = stage.get("price", "0")
+                try:
+                    price_wei = int(price_str)
+                except:
+                    price_wei = 0
+                
+                eth_price = get_eth_price_usd()
+                is_free = is_free_or_negligible(price_wei, eth_price)
+                
+                if is_free:
+                    free_mints += 1
+                    status = "🟢 مجاني"
+                else:
+                    paid_mints += 1
+                    status = "🔴 مدفوع"
+                
+                log.info(f"   📦 {name[:30]}... | {status} | السعر: {price_wei} wei")
+                
+                # إذا كان المينت مجاني، تحقق من تويتر
+                if is_free:
+                    twitter = get_cached_twitter(slug)
+                    if twitter is None:
+                        twitter = await asyncio.to_thread(
+                            get_twitter_username_from_opensea, 
+                            slug, 
+                            OPENSEA_API_KEY
+                        )
+                        set_cached_twitter(slug, twitter)
+                    
+                    if twitter:
+                        log.info(f"      ✅ تويتر: @{twitter}")
+                    else:
+                        log.info(f"      ❌ لا يوجد تويتر")
+            
+            # عرض الإحصائيات
+            log.info(f"📊 الإحصائيات: {today_mints} مينت اليوم | 🟢 مجاني: {free_mints} | 🔴 مدفوع: {paid_mints}")
+            
+            # عرض المينتات المتعقبة حالياً
+            if paid_mints_tracking:
+                log.info(f"💰 مينتات مدفوعة قيد التتبع: {len(paid_mints_tracking)}")
+                for slug in list(paid_mints_tracking.keys())[:5]:
+                    data = paid_mints_tracking[slug]
+                    wait_time = time.time() - data.get('first_seen', time.time())
+                    log.info(f"   ⏳ {slug} (انتظار: {wait_time:.0f}ث)")
+            
+            # عرض المينتات تحت المراقبة
+            if watchlist:
+                log.info(f"👀 مينتات تحت المراقبة: {len(watchlist)}")
+                for slug in list(watchlist.keys())[:5]:
+                    log.info(f"   👁️ {slug}")
+            
+        except Exception as e:
+            log.error(f"خطأ في الفحص الدوري: {e}")
+            await asyncio.sleep(10)
 
 # ---------------------------------------------------------------------------
 # watch_loop
@@ -858,7 +962,8 @@ async def run():
         listen_opensea(),
         scan_paid_mints(),
         watch_loop(),
-        status_reporter(),      # التحسين 4: تقرير الحالة كل ساعة
+        status_reporter(),
+        manual_scan(),
         telegram_sender()
     )
 
