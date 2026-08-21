@@ -3,6 +3,13 @@
   - يكتشف مينتات اليوم على Robinhood + Ethereum
   - يشتري لجميع المحافظ المعرفة بالتوازي (Parallel Execution)
   - يرسل إشعار الشراء فقط
+  
+تحسينات:
+- تعلم أنماط التحول من مدفوع إلى مجاني
+- فحص تنبؤي للمينتات القريبة من التحول
+- إحصائيات أداء البوت
+- إشعارات حالة البوت الدورية (كل ساعة)
+- إشعار عند بدء التشغيل
 """
 
 import asyncio
@@ -11,6 +18,7 @@ import logging
 import os
 import time
 from datetime import datetime, timezone, timedelta
+from collections import defaultdict
 
 import requests
 import websockets
@@ -98,6 +106,89 @@ rejected_cooldown: dict[str, float] = {}
 
 paid_mints_tracking: dict[str, dict] = {}
 
+# ==================== التحسين 1: تعلم أنماط التحول ====================
+
+conversion_patterns: dict[str, list] = {}  # slug -> [wait_times]
+
+def learn_conversion_pattern(slug: str, wait_time: float):
+    """تسجيل مدة الانتظار للتحول من مدفوع إلى مجاني"""
+    if slug not in conversion_patterns:
+        conversion_patterns[slug] = []
+    conversion_patterns[slug].append(wait_time)
+    # الاحتفاظ بآخر 10 قيم فقط
+    if len(conversion_patterns[slug]) > 10:
+        conversion_patterns[slug] = conversion_patterns[slug][-10:]
+    
+    log.info(f"📊 تعلم نمط تحول '{slug}': {wait_time:.0f} ثانية (متوسط: {get_average_conversion_time(slug):.0f})")
+
+def get_average_conversion_time(slug: str) -> float:
+    """الحصول على متوسط وقت التحول لمينت معين"""
+    if slug not in conversion_patterns or not conversion_patterns[slug]:
+        return 0
+    return sum(conversion_patterns[slug]) / len(conversion_patterns[slug])
+
+def get_fast_converting_mints(limit: int = 5) -> list:
+    """الحصول على المينتات التي تتحول بسرعة"""
+    fast_mints = []
+    for slug, times in conversion_patterns.items():
+        if times:
+            avg_time = sum(times) / len(times)
+            fast_mints.append((slug, avg_time))
+    # ترتيب حسب السرعة (الأسرع أولاً)
+    fast_mints.sort(key=lambda x: x[1])
+    return [slug for slug, _ in fast_mints[:limit]]
+
+# ==================== التحسين 2: فحص تنبؤي ====================
+
+def should_prioritize(slug: str) -> bool:
+    """تحديد إذا كان المينت قريباً من التحول (يستحق فحصاً أسرع)"""
+    data = paid_mints_tracking.get(slug, {})
+    if not data:
+        return False
+    
+    check_count = data.get('check_count', 0)
+    first_seen = data.get('first_seen', time.time())
+    wait_time = time.time() - first_seen
+    
+    # معايير الأولوية:
+    # 1. تم فحصه أكثر من 8 مرات (قد يكون قريباً من التحول)
+    # 2. ينتظر أكثر من 5 دقائق
+    # 3. من المينتات السريعة المعروفة
+    is_fast = slug in get_fast_converting_mints(limit=10)
+    
+    return check_count > 8 or wait_time > 300 or is_fast
+
+# ==================== التحسين 3: إحصائيات البوت ====================
+
+bot_stats = {
+    "start_time": time.time(),
+    "mints_detected": 0,
+    "mints_purchased": 0,
+    "purchase_attempts": 0,
+    "api_calls": 0,
+    "conversions_detected": 0,
+    "errors": 0,
+    "total_gas_spent": 0.0,
+    "mints_per_chain": defaultdict(int),
+    "wallets_used": set()
+}
+
+def update_stats(stat_name: str, value=1):
+    """تحديث إحصائيات البوت"""
+    if stat_name in bot_stats:
+        if isinstance(bot_stats[stat_name], (int, float)):
+            bot_stats[stat_name] += value
+    elif stat_name in bot_stats:
+        bot_stats[stat_name] = value
+
+def get_uptime() -> str:
+    """الحصول على وقت التشغيل بصيغة مقروءة"""
+    seconds = int(time.time() - bot_stats["start_time"])
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    seconds = seconds % 60
+    return f"{hours}h {minutes}m {seconds}s"
+
 # ==================== التخزين المؤقت ====================
 
 _twitter_cache = {}
@@ -161,6 +252,7 @@ def get_eth_price_usd() -> float:
         price = resp.json()["ethereum"]["usd"]
         _eth_price_cache["value"] = price
         _eth_price_cache["ts"] = now
+        bot_stats["api_calls"] += 1
         return price
     except Exception as e:
         log.warning(f"[السعر] تعذر جلب سعر ETH: {e}")
@@ -177,6 +269,7 @@ def fetch_drop_detail(slug: str):
             headers={"x-api-key": OPENSEA_API_KEY},
             timeout=10,
         )
+        bot_stats["api_calls"] += 1
         if resp.status_code == 200:
             detail = resp.json()
             set_cached_drop(slug, detail)
@@ -243,7 +336,7 @@ async def telegram_sender():
         send_queue.task_done()
         await asyncio.sleep(0.1)
 
-# ==================== رسائل الإشعارات فقط ====================
+# ==================== رسائل الإشعارات ====================
 
 def build_startup_message() -> str:
     """رسالة بداية التشغيل"""
@@ -253,6 +346,7 @@ def build_startup_message() -> str:
         f"📊 عدد المحافظ: {wallet_count}\n"
         f"🔗 الشبكات: Robinhood + Ethereum\n"
         f"💰 الحد الأقصى للغاز: $0.05 (Robinhood) / $0.50 (Ethereum)\n"
+        f"🧠 التحسينات: تعلم الأنماط + فحص تنبؤي + إحصائيات\n"
         f"🔄 جارٍ مراقبة المينتات المجانية..."
     )
 
@@ -263,6 +357,12 @@ def build_purchase_message(detail: dict, result: dict, chain_key: str) -> str:
     chain_label = "Robinhood" if chain_key == "robinhood" else "Ethereum"
     w_short = result['wallet'][:6] + "..." + result['wallet'][-4:]
     
+    # تحديث الإحصائيات
+    bot_stats["mints_purchased"] += 1
+    bot_stats["total_gas_spent"] += result.get('gas_fee_usd', 0)
+    bot_stats["mints_per_chain"][chain_key] += 1
+    bot_stats["wallets_used"].add(result['wallet'])
+    
     return (
         f"✅ <b>تم الشراء بنجاح!</b>\n\n"
         f"📦 المجموعة: <b>{name}</b>\n"
@@ -272,6 +372,44 @@ def build_purchase_message(detail: dict, result: dict, chain_key: str) -> str:
         f"⛽ رسوم الغاز: ${result['gas_fee_usd']:.4f}\n"
         f"🔗 المعاملة: <code>{result['tx_hash'][:10]}...</code>\n"
         f"🌐 <a href='{url}'>عرض على OpenSea</a>"
+    )
+
+def build_status_message() -> str:
+    """رسالة حالة البوت الدورية"""
+    uptime = get_uptime()
+    paid_count = len(paid_mints_tracking)
+    watch_count = len(watchlist)
+    total_mints = len(successful_mints)
+    
+    # حساب معدل النجاح
+    success_rate = 0
+    if bot_stats["purchase_attempts"] > 0:
+        success_rate = (bot_stats["mints_purchased"] / bot_stats["purchase_attempts"]) * 100
+    
+    # المينتات السريعة
+    fast_mints = get_fast_converting_mints(limit=5)
+    fast_mints_str = ", ".join(fast_mints[:3]) if fast_mints else "لا يوجد"
+    
+    return (
+        f"📊 <b>تقرير حالة البوت</b>\n\n"
+        f"⏱️ وقت التشغيل: {uptime}\n"
+        f"👛 عدد المحافظ: {len(WALLETS_DATA)}\n\n"
+        f"📈 <b>الإحصائيات:</b>\n"
+        f"✅ عمليات شراء ناجحة: {bot_stats['mints_purchased']}\n"
+        f"🔄 محاولات الشراء: {bot_stats['purchase_attempts']}\n"
+        f"📊 معدل النجاح: {success_rate:.1f}%\n"
+        f"🔍 مينتات مكتشفة: {bot_stats['mints_detected']}\n"
+        f"💰 مينتات مدفوعة قيد التتبع: {paid_count}\n"
+        f"👀 مينتات تحت المراقبة: {watch_count}\n"
+        f"📦 إجمالي المينتات: {total_mints}\n\n"
+        f"⛽ إجمالي رسوم الغاز: ${bot_stats['total_gas_spent']:.4f}\n"
+        f"📡 طلبات API: {bot_stats['api_calls']}\n\n"
+        f"⚡ <b>المينتات السريعة:</b>\n"
+        f"{fast_mints_str}\n\n"
+        f"🔄 <b>توزيع الشبكات:</b>\n"
+        f"Ethereum: {bot_stats['mints_per_chain'].get('ethereum', 0)}\n"
+        f"Robinhood: {bot_stats['mints_per_chain'].get('robinhood', 0)}\n"
+        f"❌ الأخطاء: {bot_stats['errors']}"
     )
 
 # ---------------------------------------------------------------------------
@@ -291,6 +429,8 @@ async def purchase_task_for_wallet(
         if wallet_addr in successful_mints.get(slug, set()):
             return {"success": False, "wallet": wallet_addr, "reason": "already_bought"}
 
+        bot_stats["purchase_attempts"] += 1
+        
         res = await asyncio.to_thread(
             attempt_purchase_single_wallet,
             w3, pk, wallet_addr,
@@ -384,6 +524,8 @@ async def evaluate_new_mint(slug: str, chain_key: str):
         if not stage or not started_today_local(stage):
             return
 
+        bot_stats["mints_detected"] += 1
+
         w3 = W3_INSTANCES[chain_key]
         eth_price_usd = get_eth_price_usd()
         contract_address = detail.get("contract_address")
@@ -393,7 +535,7 @@ async def evaluate_new_mint(slug: str, chain_key: str):
             price_wei = onchain_price if onchain_price is not None else int(stage.get("price", "0"))
             
             if not is_free_or_negligible(price_wei, eth_price_usd):
-                # تخزين للتتبع بدون إشعار
+                # تخزين للتتبع
                 paid_mints_tracking[slug] = {
                     "chain_key": chain_key,
                     "detail": detail,
@@ -423,11 +565,12 @@ async def evaluate_new_mint(slug: str, chain_key: str):
 
     except Exception as e:
         log.error(f"خطأ بتقييم '{slug}': {e}")
+        bot_stats["errors"] += 1
     finally:
         in_flight.discard(slug)
 
 # ---------------------------------------------------------------------------
-# فحص ذكي متكيف للمينتات المدفوعة
+# فحص ذكي متكيف للمينتات المدفوعة (مع التحسينات 1 و 2)
 # ---------------------------------------------------------------------------
 
 def calculate_adaptive_interval() -> int:
@@ -444,18 +587,28 @@ def calculate_adaptive_interval() -> int:
     else:
         return 30
 
-def get_priority_mints(limit: int = 15) -> list:
+def get_priority_mints(limit: int = 20) -> list:
+    """الحصول على المينتات ذات الأولوية (مع التحسين 2: فحص تنبؤي)"""
     if not paid_mints_tracking:
         return []
     
-    sorted_mints = sorted(
-        paid_mints_tracking.items(),
-        key=lambda x: (
-            x[1].get('first_seen', 0),
-            x[1].get('check_count', 0)
-        )
-    )
-    return sorted_mints[:limit]
+    # تقسيم المينتات إلى عادية وذات أولوية
+    normal = []
+    priority = []
+    
+    for slug, data in paid_mints_tracking.items():
+        if should_prioritize(slug):
+            priority.append((slug, data))
+        else:
+            normal.append((slug, data))
+    
+    # ترتيب الأولوية حسب الأقدمية
+    priority.sort(key=lambda x: x[1].get('first_seen', 0))
+    normal.sort(key=lambda x: x[1].get('first_seen', 0))
+    
+    # إعطاء الأولوية للمينتات ذات الأولوية أولاً
+    result = priority + normal
+    return result[:limit]
 
 async def scan_paid_mints():
     while True:
@@ -463,7 +616,7 @@ async def scan_paid_mints():
             check_interval = calculate_adaptive_interval()
             await asyncio.sleep(check_interval)
             
-            priority_mints = get_priority_mints(limit=15)
+            priority_mints = get_priority_mints(limit=20)
             
             for slug, data in priority_mints:
                 data['check_count'] = data.get('check_count', 0) + 1
@@ -492,7 +645,12 @@ async def scan_paid_mints():
                     price_wei = onchain_price if onchain_price is not None else int(stage.get("price", "0"))
                     
                     if is_free_or_negligible(price_wei, eth_price_usd):
-                        log.info(f"🔄 '{slug}' أصبح مجانياً!")
+                        # التحسين 1: تعلم نمط التحول
+                        wait_time = time.time() - data.get('first_seen', time.time())
+                        learn_conversion_pattern(slug, wait_time)
+                        bot_stats["conversions_detected"] += 1
+                        
+                        log.info(f"🔄 '{slug}' أصبح مجانياً بعد {wait_time:.0f} ثانية!")
                         paid_mints_tracking.pop(slug, None)
                         asyncio.create_task(evaluate_new_mint(slug, chain_key))
                     else:
@@ -516,7 +674,26 @@ async def scan_paid_mints():
                         
         except Exception as e:
             log.error(f"خطأ في فحص المينتات المدفوعة: {e}")
+            bot_stats["errors"] += 1
             await asyncio.sleep(5)
+
+# ---------------------------------------------------------------------------
+# التحسين 4: إشعارات حالة البوت الدورية (كل ساعة)
+# ---------------------------------------------------------------------------
+
+async def status_reporter():
+    """إرسال تقرير حالة البوت كل ساعة"""
+    last_report = time.time()
+    
+    while True:
+        await asyncio.sleep(60)  # فحص كل دقيقة
+        
+        # إرسال تقرير كل ساعة (3600 ثانية)
+        if time.time() - last_report >= 3600:
+            if bot_stats["mints_purchased"] > 0 or len(paid_mints_tracking) > 0:
+                broadcast_message(build_status_message())
+                log.info("📊 تم إرسال تقرير الحالة")
+            last_report = time.time()
 
 # ---------------------------------------------------------------------------
 # watch_loop
@@ -564,6 +741,7 @@ async def watch_loop():
 
             except Exception as e:
                 log.error(f"خطأ بدورة مراقبة '{slug}': {e}")
+                bot_stats["errors"] += 1
             finally:
                 in_flight.discard(slug)
 
@@ -659,6 +837,7 @@ async def listen_opensea():
             await asyncio.sleep(3)
         except Exception as e:
             log.error(f"خطأ غير متوقع: {e}.")
+            bot_stats["errors"] += 1
             await asyncio.sleep(5)
 
 # ==================== التشغيل الرئيسي ====================
@@ -666,7 +845,6 @@ async def listen_opensea():
 async def run():
     if not BOT_ENABLED:
         log.warning("🔴 BOT_ENABLED=false")
-        # إرسال إشعار واحد فقط
         broadcast_message("🔴 البوت في وضع الإيقاف (BOT_ENABLED=false).")
         await telegram_sender()
         return
@@ -675,10 +853,12 @@ async def run():
     broadcast_message(build_startup_message())
     log.info("🚀 تم تشغيل البوت بنجاح!")
     
+    # تشغيل جميع المهام بالتوازي
     await asyncio.gather(
         listen_opensea(),
         scan_paid_mints(),
         watch_loop(),
+        status_reporter(),      # التحسين 4: تقرير الحالة كل ساعة
         telegram_sender()
     )
 
@@ -692,6 +872,7 @@ def main():
             break
         except Exception as e:
             log.critical(f"توقف غير متوقع: {e}.")
+            bot_stats["errors"] += 1
             time.sleep(backoff)
             backoff = min(backoff * 2, 30)
             continue
