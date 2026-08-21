@@ -5,13 +5,10 @@ import time
 
 log = logging.getLogger("twitter-verifier")
 
-# تخزين مؤقت بسيط
 _twitter_cache = {}
-CACHE_DURATION = 300  # 5 دقائق
+CACHE_DURATION = 300
 
 def get_twitter_username_from_opensea(slug: str, opensea_api_key: str):
-    """جلب اسم المستخدم من OpenSea مع تخزين مؤقت"""
-    # التحقق من التخزين المؤقت أولاً
     if slug in _twitter_cache:
         username, timestamp = _twitter_cache[slug]
         if time.time() - timestamp < CACHE_DURATION:
@@ -55,20 +52,20 @@ def is_valid_twitter_account(username: str) -> bool:
                 log.info(f"✅ حساب X موثوق: @{username} (متابعين: {followers_count})")
                 return True
             else:
-                log.info(f"⚠️ حساب X ضعيف فعليًا: @{username} (متابعين: {followers_count})")
+                log.info(f"⚠️ حساب X ضعيف: @{username} (متابعين: {followers_count})")
                 return False
 
         elif resp.status_code == 429:
             log.error(f"[X API] تجاوزت حد الطلبات (429) عند فحص @{username}")
             return False
         elif resp.status_code in (401, 403):
-            log.error(f"[X API] فشل مصادقة/صلاحية (HTTP {resp.status_code}) عند فحص @{username}")
+            log.error(f"[X API] فشل مصادقة (HTTP {resp.status_code}) عند فحص @{username}")
             return False
         else:
             log.error(f"[X API] استجابة غير متوقعة (HTTP {resp.status_code}) عند فحص @{username}")
             return False
 
     except Exception as e:
-        log.error(f"[X API Error] خطأ أثناء التحقق من حساب @{username}: {e}")
+        log.error(f"[X API Error] خطأ أثناء التحقق من @{username}: {e}")
 
     return False
