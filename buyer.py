@@ -1,13 +1,12 @@
 """
 محرك الشراء التلقائي المتعدد المحافظ عبر عقد SeaDrop.
-مع تحسينات في معالجة الأخطاء وتحديد أسباب الفشل.
 """
 
 import asyncio
 import logging
 import time
 from web3 import Web3
-from web3.exceptions import ContractLogicError, TransactionNotFound
+from web3.exceptions import ContractLogicError
 from web3.middleware import ExtraDataToPOAMiddleware
 
 log = logging.getLogger("buyer")
@@ -140,25 +139,14 @@ def analyze_error(error: Exception) -> dict:
         "contract_reverted": ["execution reverted", "revert", "vm exception"],
         "sold_out": ["sold out", "max supply", "no tokens left"],
         "already_minted": ["already minted", "already claimed", "max per wallet"],
-        "not_started": ["not started", "mint not open", "not active"],
-        "invalid_address": ["invalid address", "checksum"],
-        "connection": ["connection", "timeout", "network"],
     }
     
     for reason, keywords in reasons.items():
         for keyword in keywords:
             if keyword in error_str:
-                return {
-                    "reason": reason,
-                    "message": error_str,
-                    "keywords": keyword
-                }
+                return {"reason": reason, "message": error_str}
     
-    return {
-        "reason": "unknown_error",
-        "message": error_str,
-        "keywords": "unknown"
-    }
+    return {"reason": "unknown_error", "message": error_str}
 
 def attempt_purchase_single_wallet(
     w3: Web3,
@@ -176,32 +164,17 @@ def attempt_purchase_single_wallet(
         checksum_contract = Web3.to_checksum_address(nft_contract)
     except Exception as e:
         log.error(f"[عنوان غير صالح] للمحفظة {wallet_address[:8]}...: {e}")
-        return {
-            "success": False, 
-            "wallet": wallet_address, 
-            "reason": "invalid_address", 
-            "error": str(e)
-        }
+        return {"success": False, "wallet": wallet_address, "reason": "invalid_address", "error": str(e)}
 
     balance_usd = get_wallet_balance_usd(w3, checksum_wallet, eth_price_usd)
     if balance_usd < MIN_BALANCE_RESERVE_USD:
         log.warning(f"⚠️ رصيد منخفض للمحفظة {checksum_wallet[:8]}...: ${balance_usd:.4f}")
-        return {
-            "success": False, 
-            "wallet": checksum_wallet, 
-            "reason": "balance_too_low", 
-            "balance_usd": balance_usd
-        }
+        return {"success": False, "wallet": checksum_wallet, "reason": "balance_too_low", "balance_usd": balance_usd}
 
     gas_fee_usd = estimate_gas_fee_usd(w3, eth_price_usd)
     if gas_fee_usd > max_gas_fee_usd:
         log.warning(f"⚠️ رسوم غاز مرتفعة للمحفظة {checksum_wallet[:8]}...: ${gas_fee_usd:.4f}")
-        return {
-            "success": False, 
-            "wallet": checksum_wallet, 
-            "reason": "gas_too_high", 
-            "gas_fee_usd": gas_fee_usd
-        }
+        return {"success": False, "wallet": checksum_wallet, "reason": "gas_too_high", "gas_fee_usd": gas_fee_usd}
 
     fee_recipient = get_fee_recipient(w3, checksum_contract)
     if not fee_recipient:
@@ -230,12 +203,7 @@ def attempt_purchase_single_wallet(
         })
     except Exception as e:
         log.error(f"❌ فشل بناء المعاملة للمحفظة {checksum_wallet[:8]}...: {e}")
-        return {
-            "success": False, 
-            "wallet": checksum_wallet, 
-            "reason": "build_tx_failed", 
-            "error": str(e)
-        }
+        return {"success": False, "wallet": checksum_wallet, "reason": "build_tx_failed", "error": str(e)}
 
     try:
         estimated_gas = w3.eth.estimate_gas(tx)
@@ -244,20 +212,10 @@ def attempt_purchase_single_wallet(
     except ContractLogicError as e:
         error_analysis = analyze_error(e)
         log.error(f"❌ فشل تقدير الغاز (منطق العقد) للمحفظة {checksum_wallet[:8]}...: {error_analysis['reason']}")
-        return {
-            "success": False, 
-            "wallet": checksum_wallet, 
-            "reason": f"contract_reverted_{error_analysis['reason']}",
-            "error": str(e)
-        }
+        return {"success": False, "wallet": checksum_wallet, "reason": f"contract_reverted_{error_analysis['reason']}", "error": str(e)}
     except Exception as e:
         log.error(f"❌ فشل تقدير الغاز للمحفظة {checksum_wallet[:8]}...: {e}")
-        return {
-            "success": False, 
-            "wallet": checksum_wallet, 
-            "reason": "gas_estimation_failed", 
-            "error": str(e)
-        }
+        return {"success": False, "wallet": checksum_wallet, "reason": "gas_estimation_failed", "error": str(e)}
 
     try:
         gas_price = w3.eth.gas_price
@@ -265,31 +223,17 @@ def attempt_purchase_single_wallet(
         
         if actual_gas_fee_usd > max_gas_fee_usd:
             log.warning(f"⚠️ رسوم غاز فعلية مرتفعة للمحفظة {checksum_wallet[:8]}...: ${actual_gas_fee_usd:.4f}")
-            return {
-                "success": False, 
-                "wallet": checksum_wallet, 
-                "reason": "gas_too_high_actual",
-                "gas_fee_usd": actual_gas_fee_usd
-            }
+            return {"success": False, "wallet": checksum_wallet, "reason": "gas_too_high_actual", "gas_fee_usd": actual_gas_fee_usd}
         
         total_cost_wei = total_value + (tx["gas"] * gas_price)
         wallet_balance_wei = w3.eth.get_balance(checksum_wallet)
         
         if wallet_balance_wei < total_cost_wei:
             log.warning(f"⚠️ رصيد غير كافٍ للمحفظة {checksum_wallet[:8]}...")
-            return {
-                "success": False, 
-                "wallet": checksum_wallet, 
-                "reason": "insufficient_funds_for_total_cost"
-            }
+            return {"success": False, "wallet": checksum_wallet, "reason": "insufficient_funds_for_total_cost"}
     except Exception as e:
         log.error(f"❌ فشل التحقق من التكلفة للمحفظة {checksum_wallet[:8]}...: {e}")
-        return {
-            "success": False, 
-            "wallet": checksum_wallet, 
-            "reason": "pre_send_check_failed", 
-            "error": str(e)
-        }
+        return {"success": False, "wallet": checksum_wallet, "reason": "pre_send_check_failed", "error": str(e)}
 
     for attempt in range(MAX_RETRY_ATTEMPTS):
         try:
@@ -314,20 +258,10 @@ def attempt_purchase_single_wallet(
             log.warning(f"⚠️ محاولة {attempt + 1} فشلت (منطق العقد) للمحفظة {checksum_wallet[:8]}...: {error_analysis['reason']}")
             
             if error_analysis['reason'] in ['sold_out', 'already_minted']:
-                return {
-                    "success": False, 
-                    "wallet": checksum_wallet, 
-                    "reason": error_analysis['reason'],
-                    "error": str(e)
-                }
+                return {"success": False, "wallet": checksum_wallet, "reason": error_analysis['reason'], "error": str(e)}
             
             if attempt == MAX_RETRY_ATTEMPTS - 1:
-                return {
-                    "success": False, 
-                    "wallet": checksum_wallet, 
-                    "reason": f"contract_reverted_{error_analysis['reason']}",
-                    "error": str(e)
-                }
+                return {"success": False, "wallet": checksum_wallet, "reason": f"contract_reverted_{error_analysis['reason']}", "error": str(e)}
             
             time.sleep(RETRY_DELAY_SECONDS)
             
@@ -336,18 +270,8 @@ def attempt_purchase_single_wallet(
             log.warning(f"⚠️ محاولة {attempt + 1} فشلت للمحفظة {checksum_wallet[:8]}...: {error_analysis['reason']}")
             
             if attempt == MAX_RETRY_ATTEMPTS - 1:
-                return {
-                    "success": False, 
-                    "wallet": checksum_wallet, 
-                    "reason": error_analysis['reason'],
-                    "error": str(e)
-                }
+                return {"success": False, "wallet": checksum_wallet, "reason": error_analysis['reason'], "error": str(e)}
             
             time.sleep(RETRY_DELAY_SECONDS * (attempt + 1))
     
-    return {
-        "success": False, 
-        "wallet": checksum_wallet, 
-        "reason": "max_retries_exceeded",
-        "max_attempts": MAX_RETRY_ATTEMPTS
-    }
+    return {"success": False, "wallet": checksum_wallet, "reason": "max_retries_exceeded", "max_attempts": MAX_RETRY_ATTEMPTS}
