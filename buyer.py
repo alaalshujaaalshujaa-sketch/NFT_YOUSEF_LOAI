@@ -67,14 +67,11 @@ def get_wallet_lock(wallet_address: str) -> asyncio.Lock:
     return wallet_locks[addr]
 
 def get_web3(rpc_url: str) -> Web3:
-    """إنشاء كائن Web3 مع دعم POA"""
     w3 = Web3(Web3.HTTPProvider(rpc_url))
     # إضافة middleware لـ POA (مطلوب لـ Robinhood Chain)
-    # استخدام try/except لتجنب مشاكل التكرار
     try:
         w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
     except (ValueError, TypeError):
-        # إذا كان middleware مضافاً بالفعل
         pass
     return w3
 
