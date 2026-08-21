@@ -5,6 +5,7 @@
 import asyncio
 import logging
 from web3 import Web3
+from web3.middleware import ExtraDataToPOAMiddleware
 
 log = logging.getLogger("buyer")
 
@@ -65,10 +66,17 @@ def get_wallet_lock(wallet_address: str) -> asyncio.Lock:
         wallet_locks[addr] = asyncio.Lock()
     return wallet_locks[addr]
 
-
 def get_web3(rpc_url: str) -> Web3:
-    return Web3(Web3.HTTPProvider(rpc_url))
-
+    """إنشاء كائن Web3 مع دعم POA"""
+    w3 = Web3(Web3.HTTPProvider(rpc_url))
+    # إضافة middleware لـ POA (مطلوب لـ Robinhood Chain)
+    # استخدام try/except لتجنب مشاكل التكرار
+    try:
+        w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+    except (ValueError, TypeError):
+        # إذا كان middleware مضافاً بالفعل
+        pass
+    return w3
 
 def get_wallet_balance_usd(w3: Web3, wallet_address: str, eth_price_usd: float) -> float:
     try:
@@ -79,7 +87,6 @@ def get_wallet_balance_usd(w3: Web3, wallet_address: str, eth_price_usd: float) 
         log.error(f"[الرصيد] تعذر القراءة للمحفظة {wallet_address[:8]}...: {e}")
         return 0.0
 
-
 def estimate_gas_fee_usd(w3: Web3, eth_price_usd: float, gas_units: int = 150_000) -> float:
     try:
         gas_price_wei = w3.eth.gas_price
@@ -89,8 +96,7 @@ def estimate_gas_fee_usd(w3: Web3, eth_price_usd: float, gas_units: int = 150_00
         log.warning(f"[الغاز] تعذر التقدير: {e}")
         return float("inf")
 
-
-def get_fee_recipient(w3: Web3, nft_contract: str) -> str | None:
+def get_fee_recipient(w3: Web3, nft_contract: str):
     try:
         seadrop = w3.eth.contract(address=SEADROP_ADDRESS, abi=SEADROP_ABI)
         recipients = seadrop.functions.getAllowedFeeRecipients(
@@ -103,8 +109,7 @@ def get_fee_recipient(w3: Web3, nft_contract: str) -> str | None:
         log.error(f"[عنوان الرسوم] خطأ استعلام: {e}")
         return None
 
-
-def decide_quantity(max_per_wallet: int | None, remaining_supply: int) -> int:
+def decide_quantity(max_per_wallet, remaining_supply: int) -> int:
     if max_per_wallet is None:
         qty = 5
     elif max_per_wallet <= FEW_THRESHOLD:
@@ -113,8 +118,7 @@ def decide_quantity(max_per_wallet: int | None, remaining_supply: int) -> int:
         qty = LIMITED_BUY_QTY
     return max(1, min(qty, remaining_supply))
 
-
-def get_onchain_public_price_wei(w3: Web3, nft_contract: str) -> int | None:
+def get_onchain_public_price_wei(w3: Web3, nft_contract: str):
     try:
         seadrop = w3.eth.contract(address=SEADROP_ADDRESS, abi=SEADROP_ABI)
         public_drop = seadrop.functions.getPublicDrop(
@@ -125,14 +129,13 @@ def get_onchain_public_price_wei(w3: Web3, nft_contract: str) -> int | None:
         log.warning(f"[سعر on-chain] تعذر القراءة: {e}")
         return None
 
-
 def attempt_purchase_single_wallet(
     w3: Web3,
     private_key: str,
     wallet_address: str,
     nft_contract: str,
     price_wei_per_token: int,
-    max_per_wallet: int | None,
+    max_per_wallet,
     remaining_supply: int,
     eth_price_usd: float,
     max_gas_fee_usd: float,
@@ -206,4 +209,3 @@ def attempt_purchase_single_wallet(
     except Exception as e:
         log.error(f"[خطأ إرسال للمحفظة {checksum_wallet[:8]}] {e}")
         return {"success": False, "wallet": checksum_wallet, "reason": "tx_error", "error": str(e)}
-
