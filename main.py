@@ -274,7 +274,7 @@ async def purchase_task_for_wallet(
         return res
 
 
-async def try_buy_now_multi_wallet(slug: str, chain_key: str, detail: dict) -> list[dict] | None:
+async def try_buy_now_multi_wallet(slug: str, chain_key: str, detail: dict):
     stage = detail.get("active_stage")
     if not stage:
         return None
@@ -504,7 +504,7 @@ async def run():
         await telegram_sender()
         return
 
-    broadcast_message(f"✅ تم تشغيل المحفظة الخاصة بك بنجاح وم ربطها بهذا البوت!")
+    broadcast_message(f"✅ تم تشغيل المحفظة الخاصة بك بنجاح وربطها بهذا البوت!")
     await asyncio.gather(listen_opensea(), watch_loop(), telegram_sender())
 
 
