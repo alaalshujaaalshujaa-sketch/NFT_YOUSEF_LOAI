@@ -1,16 +1,30 @@
 import os
 import logging
 import requests
+import time
 
 log = logging.getLogger("twitter-verifier")
 
+# تخزين مؤقت بسيط
+_twitter_cache = {}
+CACHE_DURATION = 300  # 5 دقائق
+
 def get_twitter_username_from_opensea(slug: str, opensea_api_key: str):
+    """جلب اسم المستخدم من OpenSea مع تخزين مؤقت"""
+    # التحقق من التخزين المؤقت أولاً
+    if slug in _twitter_cache:
+        username, timestamp = _twitter_cache[slug]
+        if time.time() - timestamp < CACHE_DURATION:
+            return username
+    
     try:
         url = f"https://api.opensea.io/api/v2/collections/{slug}"
         headers = {"x-api-key": opensea_api_key}
         resp = requests.get(url, headers=headers, timeout=5)
         if resp.status_code == 200:
-            return resp.json().get("twitter_username")
+            username = resp.json().get("twitter_username")
+            _twitter_cache[slug] = (username, time.time())
+            return username
         else:
             log.warning(f"[OpenSea Collections API] HTTP {resp.status_code} عند جلب '{slug}': {resp.text[:200]}")
     except Exception as e:
@@ -22,7 +36,7 @@ def is_valid_twitter_account(username: str) -> bool:
     if not username:
         return False
     if not bearer_token:
-        log.error("[X API] TWITTER_BEARER_TOKEN غير مضبوط في متغيرات البيئة — سيتم رفض كل الحسابات.")
+        log.error("[X API] TWITTER_BEARER_TOKEN غير مضبوط في متغيرات البيئة")
         return False
 
     try:
@@ -45,17 +59,13 @@ def is_valid_twitter_account(username: str) -> bool:
                 return False
 
         elif resp.status_code == 429:
-            log.error(f"[X API] تجاوزت حد الطلبات (429) عند فحص @{username} — لن نعتبره مرفوضًا بشكل نهائي.")
+            log.error(f"[X API] تجاوزت حد الطلبات (429) عند فحص @{username}")
             return False
         elif resp.status_code in (401, 403):
-            log.error(
-                f"[X API] فشل مصادقة/صلاحية (HTTP {resp.status_code}) عند فحص @{username}: "
-                f"{resp.text[:300]} — تحقق من أن TWITTER_BEARER_TOKEN صالح وأن الـ App "
-                f"مربوط بمشروع (Project) على خطة تدعم قراءة بيانات المستخدمين."
-            )
+            log.error(f"[X API] فشل مصادقة/صلاحية (HTTP {resp.status_code}) عند فحص @{username}")
             return False
         else:
-            log.error(f"[X API] استجابة غير متوقعة (HTTP {resp.status_code}) عند فحص @{username}: {resp.text[:300]}")
+            log.error(f"[X API] استجابة غير متوقعة (HTTP {resp.status_code}) عند فحص @{username}")
             return False
 
     except Exception as e:
