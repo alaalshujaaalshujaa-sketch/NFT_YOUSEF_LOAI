@@ -2,12 +2,7 @@
 النظام الكامل — 10 محافظ، لكل محفظة بوت تيليجرام خاص بها:
   - يكتشف مينتات اليوم على Robinhood + Ethereum
   - يشتري لجميع المحافظ المعرفة بالتوازي (Parallel Execution)
-  - يرسل إشعار الشراء أو التحديث لكل محفظة على بوت التيليجرام الخاص بها
-  
-تحسينات:
-- اكتشاف المينتات المجانية
-- فحص ذكي متكيف للمينتات المدفوعة
-- طبقات اكتشاف متعددة لعدم تفويت أي مينت
+  - يرسل إشعار الشراء فقط
 """
 
 import asyncio
@@ -101,16 +96,7 @@ rejected_cooldown: dict[str, float] = {}
 
 # ==================== تتبع المينتات المدفوعة ====================
 
-# تتبع المينتات المدفوعة التي قد تصبح مجانية
-paid_mints_tracking: dict[str, dict] = {}  # slug -> {chain_key, detail, first_seen, last_check, check_count}
-
-# إحصائيات الفحص
-scan_stats = {
-    "total_checks": 0,
-    "mints_converted": 0,
-    "avg_check_interval": 0,
-    "last_check_times": []
-}
+paid_mints_tracking: dict[str, dict] = {}
 
 # ==================== التخزين المؤقت ====================
 
@@ -257,39 +243,36 @@ async def telegram_sender():
         send_queue.task_done()
         await asyncio.sleep(0.1)
 
-def build_single_wallet_success_msg(detail: dict, result: dict, chain_key: str) -> str:
-    name = detail.get("collection_name") or detail.get("collection_slug")
-    url = detail.get("opensea_url", "")
-    chain_label = "Robinhood Chain" if chain_key == "robinhood" else "Ethereum Mainnet"
-    w_short = result['wallet'][:6] + "..." + result['wallet'][-4:]
+# ==================== رسائل الإشعارات فقط ====================
+
+def build_startup_message() -> str:
+    """رسالة بداية التشغيل"""
+    wallet_count = len(WALLETS_DATA)
     return (
-        f"✅ <b>تم الشراء بنجاح لمحافظتك!</b> ({chain_label})\n\n"
-        f"المحفظة: <code>{w_short}</code>\n"
-        f"المجموعة: <b>{name}</b>\n"
-        f"الكمية: {result['quantity']}\n"
-        f"رسوم الغاز: ${result['gas_fee_usd']:.4f}\n"
-        f"المعاملة: {result['tx_hash']}\n"
-        f"🔗 {url}"
+        f"🚀 <b>تم تشغيل البوت بنجاح!</b>\n\n"
+        f"📊 عدد المحافظ: {wallet_count}\n"
+        f"🔗 الشبكات: Robinhood + Ethereum\n"
+        f"💰 الحد الأقصى للغاز: $0.05 (Robinhood) / $0.50 (Ethereum)\n"
+        f"🔄 جارٍ مراقبة المينتات المجانية..."
     )
 
-def build_watching_message(detail: dict, reason: str) -> str:
+def build_purchase_message(detail: dict, result: dict, chain_key: str) -> str:
+    """رسالة تم الشراء بنجاح"""
     name = detail.get("collection_name") or detail.get("collection_slug")
-    return f"👀 <b>تحت المراقبة لمحافظتك</b>\n\nالمجموعة: <b>{name}</b>\nالسبب: {reason}\nسنحاول الشراء تلقائيًا فور توفر الفرصة."
-
-def build_gaveup_message(detail: dict, reason: str) -> str:
-    name = detail.get("collection_name") or detail.get("collection_slug")
-    return f"❌ <b>انتهت الفرصة</b>\n\nالمجموعة: <b>{name}</b>\nالسبب: {reason}"
-
-def build_paid_tracking_message(detail: dict, position: int = None) -> str:
-    name = detail.get("collection_name") or detail.get("collection_slug")
-    msg = f"💰 <b>مينت مدفوع قيد التتبع</b>\n\nالمجموعة: <b>{name}</b>\nالسبب: السعر الحالي مدفوع\nسيتم الشراء تلقائيًا فور تحوله إلى مجاني."
-    if position is not None:
-        msg += f"\n\nالترتيب في قائمة الانتظار: #{position}"
-    return msg
-
-def build_free_now_message(detail: dict) -> str:
-    name = detail.get("collection_name") or detail.get("collection_slug")
-    return f"🔄 <b>أصبح المينت مجانيًا!</b>\n\nالمجموعة: <b>{name}</b>\nجارٍ الشراء التلقائي..."
+    url = detail.get("opensea_url", "")
+    chain_label = "Robinhood" if chain_key == "robinhood" else "Ethereum"
+    w_short = result['wallet'][:6] + "..." + result['wallet'][-4:]
+    
+    return (
+        f"✅ <b>تم الشراء بنجاح!</b>\n\n"
+        f"📦 المجموعة: <b>{name}</b>\n"
+        f"🔗 الشبكة: {chain_label}\n"
+        f"👛 المحفظة: <code>{w_short}</code>\n"
+        f"🔢 الكمية: {result['quantity']}\n"
+        f"⛽ رسوم الغاز: ${result['gas_fee_usd']:.4f}\n"
+        f"🔗 المعاملة: <code>{result['tx_hash'][:10]}...</code>\n"
+        f"🌐 <a href='{url}'>عرض على OpenSea</a>"
+    )
 
 # ---------------------------------------------------------------------------
 # الشراء المتوازي
@@ -320,7 +303,8 @@ async def purchase_task_for_wallet(
                 successful_mints[slug] = set()
             successful_mints[slug].add(wallet_addr)
             
-            msg = build_single_wallet_success_msg(item.get("current_detail", {}), res, item.get("chain_key", ""))
+            # إرسال إشعار الشراء فقط
+            msg = build_purchase_message(item.get("current_detail", {}), res, item.get("chain_key", ""))
             enqueue_message(bot_token, chat_id, msg)
 
         return res
@@ -381,7 +365,6 @@ async def try_buy_now_multi_wallet(slug: str, chain_key: str, detail: dict):
 async def evaluate_new_mint(slug: str, chain_key: str):
     """تقييم المينت الجديد مع تتبع المينتات المدفوعة"""
     
-    # فحص سريع جداً قبل أي طلبات API
     if slug in successful_mints and len(successful_mints[slug]) >= len(WALLETS_DATA):
         return
     
@@ -393,7 +376,6 @@ async def evaluate_new_mint(slug: str, chain_key: str):
 
     in_flight.add(slug)
     try:
-        # 1. جلب تفاصيل المينت
         found, detail = await asyncio.to_thread(fetch_drop_detail, slug)
         if not found or not detail or not detail.get("is_minting"):
             return
@@ -402,7 +384,6 @@ async def evaluate_new_mint(slug: str, chain_key: str):
         if not stage or not started_today_local(stage):
             return
 
-        # 2. جلب السعر
         w3 = W3_INSTANCES[chain_key]
         eth_price_usd = get_eth_price_usd()
         contract_address = detail.get("contract_address")
@@ -411,15 +392,8 @@ async def evaluate_new_mint(slug: str, chain_key: str):
             onchain_price = await asyncio.to_thread(get_onchain_public_price_wei, w3, contract_address)
             price_wei = onchain_price if onchain_price is not None else int(stage.get("price", "0"))
             
-            # === تتبع المينتات المدفوعة ===
             if not is_free_or_negligible(price_wei, eth_price_usd):
-                # المينت مدفوع حالياً - أضفه للتتبع
-                log.info(f"💰 '{slug}' مدفوع حالياً - جارٍ التتبع لمعرفة إن أصبح مجانياً")
-                
-                # حساب الترتيب في قائمة الانتظار
-                position = len(paid_mints_tracking) + 1
-                
-                # تخزين المينت للتتبع
+                # تخزين للتتبع بدون إشعار
                 paid_mints_tracking[slug] = {
                     "chain_key": chain_key,
                     "detail": detail,
@@ -427,30 +401,21 @@ async def evaluate_new_mint(slug: str, chain_key: str):
                     "last_check": time.time(),
                     "check_count": 0
                 }
-                
-                # إرسال إشعار للمستخدمين
-                broadcast_message(build_paid_tracking_message(detail, position))
-                return  # ننتظر حتى يصبح مجانياً
+                return
 
-        # 3. الفحص عبر X مع تخزين مؤقت
         twitter_username = get_cached_twitter(slug)
         if twitter_username is None:
             twitter_username = await asyncio.to_thread(get_twitter_username_from_opensea, slug, OPENSEA_API_KEY)
             set_cached_twitter(slug, twitter_username)
         
         if not twitter_username:
-            log.info(f"⏭️ تجاهل '{slug}': لا يوجد حساب X مربوط.")
             mark_rejected(slug)
             return
 
-        log.info(f"✅ '{slug}': يوجد حساب X مربوط (@{twitter_username}) — المتابعة للشراء.")
-
-        # 4. التنفيذ للشراء التلقائي
         results = await try_buy_now_multi_wallet(slug, chain_key, detail)
 
         if results is None:
             watchlist[slug] = {"chain_key": chain_key, "detail": detail}
-            broadcast_message(build_watching_message(detail, "السعر الحالي مدفوع — تحت المراقبة."))
             return
 
         if len(successful_mints.get(slug, set())) < len(WALLETS_DATA):
@@ -466,96 +431,50 @@ async def evaluate_new_mint(slug: str, chain_key: str):
 # ---------------------------------------------------------------------------
 
 def calculate_adaptive_interval() -> int:
-    """
-    حساب فترة الفحص المتكيفة بناءً على:
-    - عدد المينتات المدفوعة
-    - وقت انتظار كل مينت
-    - أداء الفحص السابق
-    """
     paid_count = len(paid_mints_tracking)
     
-    # الحالة 1: لا يوجد مينتات مدفوعة
     if paid_count == 0:
-        return 60  # فحص كل دقيقة
-    
-    # الحالة 2: مينتات قليلة
-    if paid_count <= 3:
-        return 10  # فحص سريع كل 10 ثواني
-    
-    # الحالة 3: مينتات متوسطة
-    if paid_count <= 10:
-        return 15  # فحص كل 15 ثانية
-    
-    # الحالة 4: مينتات كثيرة
-    if paid_count <= 20:
-        return 20  # فحص كل 20 ثانية
-    
-    # الحالة 5: مينتات كثيرة جداً
-    return 30  # فحص كل 30 ثانية (تجنب الضغط)
+        return 60
+    elif paid_count <= 3:
+        return 10
+    elif paid_count <= 10:
+        return 15
+    elif paid_count <= 20:
+        return 20
+    else:
+        return 30
 
-def get_priority_mints(limit: int = 10) -> list:
-    """
-    الحصول على المينتات ذات الأولوية العالية للفحص
-    """
+def get_priority_mints(limit: int = 15) -> list:
     if not paid_mints_tracking:
         return []
     
-    # ترتيب المينتات حسب:
-    # 1. الأقدمية (first_seen) - المينتات القديمة أولاً
-    # 2. عدد مرات الفحص (check_count) - الأقل فحصاً أولاً
     sorted_mints = sorted(
         paid_mints_tracking.items(),
         key=lambda x: (
-            x[1].get('first_seen', 0),  # الأقدم أولاً
-            x[1].get('check_count', 0)   # الأقل فحصاً أولاً
+            x[1].get('first_seen', 0),
+            x[1].get('check_count', 0)
         )
     )
-    
     return sorted_mints[:limit]
 
 async def scan_paid_mints():
-    """
-    فحص ذكي متكيف للمينتات المدفوعة
-    - يتكيف مع عدد المينتات
-    - يعطي أولوية للمينتات الأقدم
-    - يتجنب الضغط على الـ API
-    """
     while True:
         try:
-            # حساب فترة الفحص المتكيفة
             check_interval = calculate_adaptive_interval()
             await asyncio.sleep(check_interval)
             
-            # تحديث الإحصائيات
-            scan_stats["total_checks"] += 1
-            scan_stats["last_check_times"].append(time.time())
-            if len(scan_stats["last_check_times"]) > 100:
-                scan_stats["last_check_times"] = scan_stats["last_check_times"][-100:]
-            
-            # إذا كان العدد كبيراً، أظهر إحصائيات
-            paid_count = len(paid_mints_tracking)
-            if paid_count > 10:
-                log.info(f"📊 فحص {paid_count} مينت مدفوع (فترة: {check_interval}ث)")
-            
-            # الحصول على المينتات ذات الأولوية
             priority_mints = get_priority_mints(limit=15)
             
             for slug, data in priority_mints:
-                # تحديث عدد مرات الفحص
                 data['check_count'] = data.get('check_count', 0) + 1
                 data['last_check'] = time.time()
                 
-                # التحقق من أنه لا يزال في المراقبة
                 if slug in successful_mints and len(successful_mints[slug]) >= len(WALLETS_DATA):
-                    log.info(f"✅ '{slug}' تم شراؤه بالكامل - إزالة من التتبع")
                     paid_mints_tracking.pop(slug, None)
                     continue
                 
-                # جلب التفاصيل الجديدة
                 found, fresh_detail = await asyncio.to_thread(fetch_drop_detail, slug)
                 if not found or not fresh_detail or not fresh_detail.get("is_minting"):
-                    wait_time = time.time() - data.get('first_seen', time.time())
-                    log.info(f"⏹️ '{slug}' لم يعد نشطاً بعد {wait_time:.0f}ث - إزالة من التتبع")
                     paid_mints_tracking.pop(slug, None)
                     continue
                 
@@ -563,7 +482,6 @@ async def scan_paid_mints():
                 if not stage:
                     continue
                 
-                # جلب السعر الجديد
                 chain_key = data.get("chain_key", "ethereum")
                 w3 = W3_INSTANCES[chain_key]
                 eth_price_usd = get_eth_price_usd()
@@ -573,24 +491,11 @@ async def scan_paid_mints():
                     onchain_price = await asyncio.to_thread(get_onchain_public_price_wei, w3, contract_address)
                     price_wei = onchain_price if onchain_price is not None else int(stage.get("price", "0"))
                     
-                    # هل أصبح مجانياً؟
                     if is_free_or_negligible(price_wei, eth_price_usd):
-                        wait_time = time.time() - data.get('first_seen', time.time())
-                        log.info(f"🔄 [تغير السعر] '{slug}' أصبح مجانياً بعد {wait_time:.0f}ث! جارٍ الشراء...")
-                        
-                        # تحديث الإحصائيات
-                        scan_stats["mints_converted"] += 1
-                        
-                        # إرسال إشعار للمستخدمين
-                        broadcast_message(build_free_now_message(fresh_detail))
-                        
-                        # إزالة من التتبع
+                        log.info(f"🔄 '{slug}' أصبح مجانياً!")
                         paid_mints_tracking.pop(slug, None)
-                        
-                        # معالجة المينت كأنه جديد
                         asyncio.create_task(evaluate_new_mint(slug, chain_key))
                     else:
-                        # لا يزال مدفوعاً، تحديث التفاصيل
                         paid_mints_tracking[slug] = {
                             "chain_key": chain_key,
                             "detail": fresh_detail,
@@ -599,24 +504,22 @@ async def scan_paid_mints():
                             "check_count": data.get("check_count", 0)
                         }
             
-            # تنظيف المينتات القديمة جداً (أكثر من ساعة)
+            # تنظيف المينتات القديمة
             now = time.time()
             expired = []
             for slug, data in paid_mints_tracking.items():
-                if now - data.get('first_seen', now) > 3600:  # ساعة
+                if now - data.get('first_seen', now) > 3600:
                     expired.append(slug)
             
             for slug in expired:
-                wait_time = time.time() - paid_mints_tracking[slug].get('first_seen', time.time())
-                log.info(f"⏰ '{slug}' انتهت صلاحية التتبع بعد {wait_time:.0f}ث - إزالة")
                 paid_mints_tracking.pop(slug, None)
                         
         except Exception as e:
             log.error(f"خطأ في فحص المينتات المدفوعة: {e}")
-            await asyncio.sleep(5)  # انتظار قبل إعادة المحاولة
+            await asyncio.sleep(5)
 
 # ---------------------------------------------------------------------------
-# watch_loop (نفس الكود الأصلي)
+# watch_loop
 # ---------------------------------------------------------------------------
 
 async def watch_loop():
@@ -641,13 +544,11 @@ async def watch_loop():
 
                 if not found or not fresh_detail or not fresh_detail.get("is_minting"):
                     watchlist.pop(slug, None)
-                    broadcast_message(build_gaveup_message(entry["detail"], "المينت لم يعد نشطًا."))
                     continue
 
                 stage = fresh_detail.get("active_stage")
                 if not stage or (stage_has_ended(stage) and not fresh_detail.get("next_stage")):
                     watchlist.pop(slug, None)
-                    broadcast_message(build_gaveup_message(fresh_detail, "انتهت المرحلة."))
                     continue
 
                 results = await try_buy_now_multi_wallet(slug, chain_key, fresh_detail)
@@ -765,18 +666,20 @@ async def listen_opensea():
 async def run():
     if not BOT_ENABLED:
         log.warning("🔴 BOT_ENABLED=false")
-        broadcast_message("🔴 البوت شغّال لكن بوضع الإيقاف (BOT_ENABLED=false).")
+        # إرسال إشعار واحد فقط
+        broadcast_message("🔴 البوت في وضع الإيقاف (BOT_ENABLED=false).")
         await telegram_sender()
         return
 
-    broadcast_message(f"✅ تم تشغيل المحفظة الخاصة بك بنجاح وربطها بهذا البوت!")
+    # إرسال رسالة بداية التشغيل
+    broadcast_message(build_startup_message())
+    log.info("🚀 تم تشغيل البوت بنجاح!")
     
-    # تشغيل جميع المهام بالتوازي
     await asyncio.gather(
-        listen_opensea(),        # الطبقة 1: WebSocket
-        scan_paid_mints(),       # الطبقة 2: فحص ذكي متكيف
-        watch_loop(),            # مراقبة المينتات المدفوعة
-        telegram_sender()        # إرسال الرسائل
+        listen_opensea(),
+        scan_paid_mints(),
+        watch_loop(),
+        telegram_sender()
     )
 
 def main():
