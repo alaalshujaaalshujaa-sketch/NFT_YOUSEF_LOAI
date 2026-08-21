@@ -11,6 +11,8 @@
 - إشعارات حالة البوت الدورية (كل ساعة)
 - إشعار عند بدء التشغيل
 - فحص دوري للمينتات النشطة (كل دقيقة)
+- تحسينات في إرسال رسائل التيليجرام
+- اختبار التيليجرام عند بدء التشغيل
 """
 
 import asyncio
@@ -116,33 +118,28 @@ def learn_conversion_pattern(slug: str, wait_time: float):
     if slug not in conversion_patterns:
         conversion_patterns[slug] = []
     conversion_patterns[slug].append(wait_time)
-    # الاحتفاظ بآخر 10 قيم فقط
     if len(conversion_patterns[slug]) > 10:
         conversion_patterns[slug] = conversion_patterns[slug][-10:]
     
     log.info(f"📊 تعلم نمط تحول '{slug}': {wait_time:.0f} ثانية (متوسط: {get_average_conversion_time(slug):.0f})")
 
 def get_average_conversion_time(slug: str) -> float:
-    """الحصول على متوسط وقت التحول لمينت معين"""
     if slug not in conversion_patterns or not conversion_patterns[slug]:
         return 0
     return sum(conversion_patterns[slug]) / len(conversion_patterns[slug])
 
 def get_fast_converting_mints(limit: int = 5) -> list:
-    """الحصول على المينتات التي تتحول بسرعة"""
     fast_mints = []
     for slug, times in conversion_patterns.items():
         if times:
             avg_time = sum(times) / len(times)
             fast_mints.append((slug, avg_time))
-    # ترتيب حسب السرعة (الأسرع أولاً)
     fast_mints.sort(key=lambda x: x[1])
     return [slug for slug, _ in fast_mints[:limit]]
 
 # ==================== التحسين 2: فحص تنبؤي ====================
 
 def should_prioritize(slug: str) -> bool:
-    """تحديد إذا كان المينت قريباً من التحول (يستحق فحصاً أسرع)"""
     data = paid_mints_tracking.get(slug, {})
     if not data:
         return False
@@ -150,11 +147,6 @@ def should_prioritize(slug: str) -> bool:
     check_count = data.get('check_count', 0)
     first_seen = data.get('first_seen', time.time())
     wait_time = time.time() - first_seen
-    
-    # معايير الأولوية:
-    # 1. تم فحصه أكثر من 8 مرات (قد يكون قريباً من التحول)
-    # 2. ينتظر أكثر من 5 دقائق
-    # 3. من المينتات السريعة المعروفة
     is_fast = slug in get_fast_converting_mints(limit=10)
     
     return check_count > 8 or wait_time > 300 or is_fast
@@ -171,17 +163,12 @@ bot_stats = {
     "errors": 0,
     "total_gas_spent": 0.0,
     "mints_per_chain": defaultdict(int),
-    "wallets_used": set()
+    "wallets_used": set(),
+    "telegram_messages_sent": 0,
+    "telegram_errors": 0
 }
 
-def update_stats(stat_name: str, value=1):
-    """تحديث إحصائيات البوت"""
-    if stat_name in bot_stats:
-        if isinstance(bot_stats[stat_name], (int, float)):
-            bot_stats[stat_name] += value
-
 def get_uptime() -> str:
-    """الحصول على وقت التشغيل بصيغة مقروءة"""
     seconds = int(time.time() - bot_stats["start_time"])
     hours = seconds // 3600
     minutes = (seconds % 3600) // 60
@@ -302,13 +289,29 @@ def is_free_or_negligible(price_wei: int, eth_price_usd: float) -> bool:
     price_usd = (price_wei / 1e18) * eth_price_usd
     return price_usd < FREE_PRICE_THRESHOLD_USD
 
-# ---------------------------------------------------------------------------
-# إدارة رسائل التيليجرام
-# ---------------------------------------------------------------------------
+def will_start_soon(stage: dict, minutes: int = 60) -> bool:
+    start = parse_iso(stage.get("start_time", ""))
+    if not start:
+        return False
+    now = datetime.now(timezone.utc)
+    time_diff = (start - now).total_seconds() / 60
+    return 0 <= time_diff <= minutes
+
+def is_active_or_upcoming(stage: dict) -> bool:
+    if started_today_local(stage):
+        return True
+    if will_start_soon(stage, 60):
+        return True
+    return False
+
+# ==================== إدارة رسائل التيليجرام المحسنة ====================
 
 send_queue: "asyncio.Queue[dict]" = asyncio.Queue()
 
 def enqueue_message(bot_token: str, chat_id: str, text: str):
+    """إضافة إشعار جديد مع تحديد البوت والمستلم"""
+    log.info(f"📝 إضافة رسالة إلى الـ Queue (للبوت: {bot_token[:10]}...)")
+    
     send_queue.put_nowait({
         "bot_token": bot_token,
         "chat_id": chat_id,
@@ -316,29 +319,94 @@ def enqueue_message(bot_token: str, chat_id: str, text: str):
     })
 
 def broadcast_message(text: str):
+    """إرسال إشعار عام لجميع البوتات"""
     for w in WALLETS_DATA:
         enqueue_message(w["bot_token"], w["chat_id"], text)
 
 async def telegram_sender():
+    """إرسال رسائل التيليجرام مع معالجة أفضل للأخطاء"""
     while True:
-        msg = await send_queue.get()
         try:
-            telegram_api = f"https://api.telegram.org/bot{msg['bot_token']}"
-            await asyncio.to_thread(
-                requests.post,
+            msg = await send_queue.get()
+            
+            bot_token = msg.get("bot_token")
+            chat_id = msg.get("chat_id")
+            text = msg.get("text", "")
+            
+            if not bot_token or not chat_id:
+                log.warning("⚠️ رسالة بدون bot_token أو chat_id")
+                send_queue.task_done()
+                continue
+            
+            try:
+                telegram_api = f"https://api.telegram.org/bot{bot_token}"
+                
+                response = await asyncio.to_thread(
+                    requests.post,
+                    f"{telegram_api}/sendMessage",
+                    data={
+                        "chat_id": chat_id, 
+                        "text": text, 
+                        "parse_mode": "HTML",
+                        "disable_web_page_preview": True
+                    },
+                    timeout=15,
+                )
+                
+                if response.status_code == 200:
+                    bot_stats["telegram_messages_sent"] += 1
+                    log.info(f"✅ تم إرسال رسالة تليجرام بنجاح (للبوت: {bot_token[:10]}...)")
+                else:
+                    bot_stats["telegram_errors"] += 1
+                    log.error(f"❌ فشل إرسال تليجرام: {response.status_code} - {response.text[:200]}")
+                    
+            except requests.exceptions.Timeout:
+                bot_stats["telegram_errors"] += 1
+                log.error(f"⏰ انتهى وقت إرسال تليجرام (للبوت: {bot_token[:10]}...)")
+            except Exception as e:
+                bot_stats["telegram_errors"] += 1
+                log.error(f"❌ خطأ في إرسال تليجرام: {e}")
+                
+        except Exception as e:
+            log.error(f"❌ خطأ في telegram_sender: {e}")
+        finally:
+            send_queue.task_done()
+            await asyncio.sleep(0.1)
+
+# ==================== اختبار التيليجرام ====================
+
+async def test_telegram():
+    """اختبار إرسال رسالة تجريبية لكل بوت"""
+    log.info("📤 جاري اختبار إرسال رسائل التيليجرام...")
+    
+    for i, w in enumerate(WALLETS_DATA):
+        try:
+            bot_token = w["bot_token"]
+            chat_id = w["chat_id"]
+            
+            test_msg = f"🧪 <b>رسالة اختبار</b>\n\nالبوت #{i+1}\nالمحفظة: {w['wallet'][:8]}...\nالوقت: {datetime.now().strftime('%H:%M:%S')}"
+            
+            telegram_api = f"https://api.telegram.org/bot{bot_token}"
+            resp = requests.post(
                 f"{telegram_api}/sendMessage",
-                data={"chat_id": msg["chat_id"], "text": msg["text"], "parse_mode": "HTML"},
+                data={"chat_id": chat_id, "text": test_msg, "parse_mode": "HTML"},
                 timeout=10,
             )
+            
+            if resp.status_code == 200:
+                log.info(f"✅ تم إرسال رسالة اختبار للبوت #{i+1}")
+                bot_stats["telegram_messages_sent"] += 1
+            else:
+                log.error(f"❌ فشل إرسال رسالة اختبار للبوت #{i+1}: {resp.status_code} - {resp.text[:100]}")
+                bot_stats["telegram_errors"] += 1
+                
         except Exception as e:
-            log.error(f"خطأ إرسال تليجرام للبوت ({msg['bot_token'][:10]}...): {e}")
-        send_queue.task_done()
-        await asyncio.sleep(0.1)
+            log.error(f"❌ خطأ في اختبار البوت #{i+1}: {e}")
+            bot_stats["telegram_errors"] += 1
 
 # ==================== رسائل الإشعارات ====================
 
 def build_startup_message() -> str:
-    """رسالة بداية التشغيل"""
     wallet_count = len(WALLETS_DATA)
     return (
         f"🚀 <b>تم تشغيل البوت بنجاح!</b>\n\n"
@@ -350,17 +418,17 @@ def build_startup_message() -> str:
     )
 
 def build_purchase_message(detail: dict, result: dict, chain_key: str) -> str:
-    """رسالة تم الشراء بنجاح"""
     name = detail.get("collection_name") or detail.get("collection_slug")
     url = detail.get("opensea_url", "")
     chain_label = "Robinhood" if chain_key == "robinhood" else "Ethereum"
     w_short = result['wallet'][:6] + "..." + result['wallet'][-4:]
     
-    # تحديث الإحصائيات
     bot_stats["mints_purchased"] += 1
     bot_stats["total_gas_spent"] += result.get('gas_fee_usd', 0)
     bot_stats["mints_per_chain"][chain_key] += 1
     bot_stats["wallets_used"].add(result['wallet'])
+    
+    log.info(f"📤 إرسال رسالة شراء للمحفظة {w_short}: {name}")
     
     return (
         f"✅ <b>تم الشراء بنجاح!</b>\n\n"
@@ -374,18 +442,15 @@ def build_purchase_message(detail: dict, result: dict, chain_key: str) -> str:
     )
 
 def build_status_message() -> str:
-    """رسالة حالة البوت الدورية"""
     uptime = get_uptime()
     paid_count = len(paid_mints_tracking)
     watch_count = len(watchlist)
     total_mints = len(successful_mints)
     
-    # حساب معدل النجاح
     success_rate = 0
     if bot_stats["purchase_attempts"] > 0:
         success_rate = (bot_stats["mints_purchased"] / bot_stats["purchase_attempts"]) * 100
     
-    # المينتات السريعة
     fast_mints = get_fast_converting_mints(limit=5)
     fast_mints_str = ", ".join(fast_mints[:3]) if fast_mints else "لا يوجد"
     
@@ -402,13 +467,15 @@ def build_status_message() -> str:
         f"👀 مينتات تحت المراقبة: {watch_count}\n"
         f"📦 إجمالي المينتات: {total_mints}\n\n"
         f"⛽ إجمالي رسوم الغاز: ${bot_stats['total_gas_spent']:.4f}\n"
-        f"📡 طلبات API: {bot_stats['api_calls']}\n\n"
+        f"📡 طلبات API: {bot_stats['api_calls']}\n"
+        f"📨 رسائل تليجرام مرسلة: {bot_stats['telegram_messages_sent']}\n"
+        f"❌ أخطاء تليجرام: {bot_stats['telegram_errors']}\n\n"
         f"⚡ <b>المينتات السريعة:</b>\n"
         f"{fast_mints_str}\n\n"
         f"🔄 <b>توزيع الشبكات:</b>\n"
         f"Ethereum: {bot_stats['mints_per_chain'].get('ethereum', 0)}\n"
         f"Robinhood: {bot_stats['mints_per_chain'].get('robinhood', 0)}\n"
-        f"❌ الأخطاء: {bot_stats['errors']}"
+        f"❌ الأخطاء الكلية: {bot_stats['errors']}"
     )
 
 # ---------------------------------------------------------------------------
@@ -442,7 +509,6 @@ async def purchase_task_for_wallet(
                 successful_mints[slug] = set()
             successful_mints[slug].add(wallet_addr)
             
-            # إرسال إشعار الشراء فقط
             msg = build_purchase_message(item.get("current_detail", {}), res, item.get("chain_key", ""))
             enqueue_message(bot_token, chat_id, msg)
 
@@ -498,12 +564,10 @@ async def try_buy_now_multi_wallet(slug: str, chain_key: str, detail: dict):
     return list(results)
 
 # ---------------------------------------------------------------------------
-# تقييم المينتات (مع تتبع المدفوعة)
+# تقييم المينتات
 # ---------------------------------------------------------------------------
 
 async def evaluate_new_mint(slug: str, chain_key: str):
-    """تقييم المينت الجديد مع تتبع المينتات المدفوعة"""
-    
     if slug in successful_mints and len(successful_mints[slug]) >= len(WALLETS_DATA):
         return
     
@@ -520,7 +584,7 @@ async def evaluate_new_mint(slug: str, chain_key: str):
             return
 
         stage = detail.get("active_stage")
-        if not stage or not started_today_local(stage):
+        if not stage:
             return
 
         bot_stats["mints_detected"] += 1
@@ -534,7 +598,6 @@ async def evaluate_new_mint(slug: str, chain_key: str):
             price_wei = onchain_price if onchain_price is not None else int(stage.get("price", "0"))
             
             if not is_free_or_negligible(price_wei, eth_price_usd):
-                # تخزين للتتبع
                 paid_mints_tracking[slug] = {
                     "chain_key": chain_key,
                     "detail": detail,
@@ -569,7 +632,7 @@ async def evaluate_new_mint(slug: str, chain_key: str):
         in_flight.discard(slug)
 
 # ---------------------------------------------------------------------------
-# فحص ذكي متكيف للمينتات المدفوعة (مع التحسينات 1 و 2)
+# فحص ذكي للمينتات المدفوعة
 # ---------------------------------------------------------------------------
 
 def calculate_adaptive_interval() -> int:
@@ -587,11 +650,9 @@ def calculate_adaptive_interval() -> int:
         return 30
 
 def get_priority_mints(limit: int = 20) -> list:
-    """الحصول على المينتات ذات الأولوية (مع التحسين 2: فحص تنبؤي)"""
     if not paid_mints_tracking:
         return []
     
-    # تقسيم المينتات إلى عادية وذات أولوية
     normal = []
     priority = []
     
@@ -601,11 +662,9 @@ def get_priority_mints(limit: int = 20) -> list:
         else:
             normal.append((slug, data))
     
-    # ترتيب الأولوية حسب الأقدمية
     priority.sort(key=lambda x: x[1].get('first_seen', 0))
     normal.sort(key=lambda x: x[1].get('first_seen', 0))
     
-    # إعطاء الأولوية للمينتات ذات الأولوية أولاً
     result = priority + normal
     return result[:limit]
 
@@ -644,7 +703,6 @@ async def scan_paid_mints():
                     price_wei = onchain_price if onchain_price is not None else int(stage.get("price", "0"))
                     
                     if is_free_or_negligible(price_wei, eth_price_usd):
-                        # التحسين 1: تعلم نمط التحول
                         wait_time = time.time() - data.get('first_seen', time.time())
                         learn_conversion_pattern(slug, wait_time)
                         bot_stats["conversions_detected"] += 1
@@ -661,7 +719,6 @@ async def scan_paid_mints():
                             "check_count": data.get("check_count", 0)
                         }
             
-            # تنظيف المينتات القديمة
             now = time.time()
             expired = []
             for slug, data in paid_mints_tracking.items():
@@ -677,35 +734,31 @@ async def scan_paid_mints():
             await asyncio.sleep(5)
 
 # ---------------------------------------------------------------------------
-# التحسين 4: إشعارات حالة البوت الدورية (كل ساعة)
+# إشعارات الحالة الدورية
 # ---------------------------------------------------------------------------
 
 async def status_reporter():
-    """إرسال تقرير حالة البوت كل ساعة"""
     last_report = time.time()
     
     while True:
-        await asyncio.sleep(60)  # فحص كل دقيقة
+        await asyncio.sleep(60)
         
-        # إرسال تقرير كل ساعة (3600 ثانية)
         if time.time() - last_report >= 3600:
             broadcast_message(build_status_message())
             log.info("📊 تم إرسال تقرير الحالة")
             last_report = time.time()
 
 # ---------------------------------------------------------------------------
-# فحص دوري للمينتات النشطة (كل دقيقة)
+# فحص دوري للمينتات النشطة
 # ---------------------------------------------------------------------------
 
 async def manual_scan():
-    """فحص يدوي للمينتات النشطة وعرضها في السجلات"""
     while True:
         try:
-            await asyncio.sleep(60)  # كل دقيقة
+            await asyncio.sleep(60)
             
             log.info("🔍 [فحص دوري] جاري فحص المينتات النشطة...")
             
-            # جلب المينتات النشطة
             url = f"{DROPS_API_BASE}?limit=30"
             headers = {"x-api-key": OPENSEA_API_KEY}
             resp = requests.get(url, headers=headers, timeout=10)
@@ -728,8 +781,7 @@ async def manual_scan():
             
             log.info(f"📊 تم العثور على {total_mints} مينت نشط")
             
-            # عرض تفاصيل كل مينت
-            for drop in drops[:10]:  # عرض أول 10 فقط
+            for drop in drops[:10]:
                 slug = drop.get("slug")
                 name = drop.get("collection_name") or slug
                 stage = drop.get("active_stage", {})
@@ -737,13 +789,11 @@ async def manual_scan():
                 if not stage:
                     continue
                 
-                # التحقق من تاريخ المينت
-                if not started_today_local(stage):
+                if not is_active_or_upcoming(stage):
                     continue
                 
                 today_mints += 1
                 
-                # جلب السعر
                 price_str = stage.get("price", "0")
                 try:
                     price_wei = int(price_str)
@@ -762,7 +812,6 @@ async def manual_scan():
                 
                 log.info(f"   📦 {name[:30]}... | {status} | السعر: {price_wei} wei")
                 
-                # إذا كان المينت مجاني، تحقق من تويتر
                 if is_free:
                     twitter = get_cached_twitter(slug)
                     if twitter is None:
@@ -778,10 +827,8 @@ async def manual_scan():
                     else:
                         log.info(f"      ❌ لا يوجد تويتر")
             
-            # عرض الإحصائيات
             log.info(f"📊 الإحصائيات: {today_mints} مينت اليوم | 🟢 مجاني: {free_mints} | 🔴 مدفوع: {paid_mints}")
             
-            # عرض المينتات المتعقبة حالياً
             if paid_mints_tracking:
                 log.info(f"💰 مينتات مدفوعة قيد التتبع: {len(paid_mints_tracking)}")
                 for slug in list(paid_mints_tracking.keys())[:5]:
@@ -789,7 +836,6 @@ async def manual_scan():
                     wait_time = time.time() - data.get('first_seen', time.time())
                     log.info(f"   ⏳ {slug} (انتظار: {wait_time:.0f}ث)")
             
-            # عرض المينتات تحت المراقبة
             if watchlist:
                 log.info(f"👀 مينتات تحت المراقبة: {len(watchlist)}")
                 for slug in list(watchlist.keys())[:5]:
@@ -797,6 +843,86 @@ async def manual_scan():
             
         except Exception as e:
             log.error(f"خطأ في الفحص الدوري: {e}")
+            await asyncio.sleep(10)
+
+# ---------------------------------------------------------------------------
+# فحص نشط للمينتات المجانية
+# ---------------------------------------------------------------------------
+
+async def scan_for_free_mints():
+    while True:
+        try:
+            await asyncio.sleep(30)
+            
+            log.info("🔍 [فحص مجاني] جاري البحث عن مينتات مجانية...")
+            
+            url = f"{DROPS_API_BASE}?limit=50"
+            headers = {"x-api-key": OPENSEA_API_KEY}
+            resp = requests.get(url, headers=headers, timeout=10)
+            
+            if resp.status_code != 200:
+                log.warning(f"⚠️ فشل جلب المينتات: {resp.status_code}")
+                continue
+            
+            data = resp.json()
+            drops = data.get("drops", [])
+            
+            if not drops:
+                log.info("📭 لا توجد مينتات")
+                continue
+            
+            eth_price_usd = get_eth_price_usd()
+            
+            for drop in drops:
+                slug = drop.get("slug")
+                if not slug:
+                    continue
+                
+                if slug in successful_mints and len(successful_mints[slug]) >= len(WALLETS_DATA):
+                    continue
+                
+                if slug in in_flight:
+                    continue
+                
+                stage = drop.get("active_stage", {})
+                if not stage:
+                    continue
+                
+                price_str = stage.get("price", "0")
+                try:
+                    price_wei = int(price_str)
+                except:
+                    price_wei = 0
+                
+                is_free = is_free_or_negligible(price_wei, eth_price_usd)
+                
+                if is_free:
+                    log.info(f"🆓 [مجاني] تم العثور على مينت مجاني: {slug}")
+                    
+                    twitter = get_cached_twitter(slug)
+                    if twitter is None:
+                        twitter = await asyncio.to_thread(
+                            get_twitter_username_from_opensea, 
+                            slug, 
+                            OPENSEA_API_KEY
+                        )
+                        set_cached_twitter(slug, twitter)
+                    
+                    if not twitter:
+                        log.info(f"   ⚠️ لا يوجد تويتر للمينت {slug} - سيتم تجاهله")
+                        continue
+                    
+                    log.info(f"   ✅ تويتر موجود: @{twitter}")
+                    log.info(f"   🔄 جارٍ الشراء...")
+                    
+                    chain_key = "ethereum"
+                    if drop.get("chain") == "robinhood":
+                        chain_key = "robinhood"
+                    
+                    asyncio.create_task(evaluate_new_mint(slug, chain_key))
+                    
+        except Exception as e:
+            log.error(f"خطأ في فحص المينتات المجانية: {e}")
             await asyncio.sleep(10)
 
 # ---------------------------------------------------------------------------
@@ -957,6 +1083,10 @@ async def run():
     broadcast_message(build_startup_message())
     log.info("🚀 تم تشغيل البوت بنجاح!")
     
+    # اختبار التيليجرام بعد 5 ثواني
+    await asyncio.sleep(5)
+    await test_telegram()
+    
     # تشغيل جميع المهام بالتوازي
     await asyncio.gather(
         listen_opensea(),
@@ -964,6 +1094,7 @@ async def run():
         watch_loop(),
         status_reporter(),
         manual_scan(),
+        scan_for_free_mints(),
         telegram_sender()
     )
 
