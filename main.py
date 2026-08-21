@@ -3,6 +3,11 @@
   - يكتشف مينتات اليوم على Robinhood + Ethereum
   - يشتري لجميع المحافظ المعرفة بالتوازي (Parallel Execution)
   - يرسل إشعار الشراء أو التحديث لكل محفظة على بوت التيليجرام الخاص بها
+  
+تحسينات:
+- اكتشاف المينتات المجانية
+- تتبع المينتات المدفوعة لمعرفة إن أصبحت مجانية
+- طبقات اكتشاف متعددة لعدم تفويت أي مينت
 """
 
 import asyncio
@@ -90,28 +95,31 @@ successful_mints: dict[str, set[str]] = {}
 watchlist: dict[str, dict] = {}
 in_flight: set[str] = set()
 
-# تبريد مؤقت للمجموعات التي رُفضت (سعر، تويتر، إلخ) لمنع إعادة فحصها
+# تبريد مؤقت للمجموعات التي رُفضت
 REJECTION_COOLDOWN_SECONDS = 120
 rejected_cooldown: dict[str, float] = {}
 
-# ==================== تحسينات الاكتشاف ====================
+# ==================== تتبع المينتات المدفوعة ====================
 
-# تخزين مؤقت لنتائج Twitter
+# تتبع المينتات المدفوعة التي قد تصبح مجانية
+paid_mints_tracking: dict[str, dict] = {}  # slug -> {chain_key, detail, first_seen, last_check}
+
+# ==================== التخزين المؤقت ====================
+
 _twitter_cache = {}
-TWITTER_CACHE_DURATION = 300  # 5 دقائق
+TWITTER_CACHE_DURATION = 300
 
-# تخزين مؤقت لتفاصيل المينتات
 _drop_cache = {}
-DROP_CACHE_DURATION = 30  # 30 ثانية
+DROP_CACHE_DURATION = 30
 
-# تخزين الأحداث للمعالجة المجمعة
 event_buffer = []
 last_flush = time.time()
-BUFFER_FLUSH_INTERVAL = 3  # 3 ثواني
-MAX_BUFFER_SIZE = 5  # 5 أحداث
+BUFFER_FLUSH_INTERVAL = 3
+MAX_BUFFER_SIZE = 5
+
+# ==================== دوال التخزين المؤقت ====================
 
 def get_cached_twitter(slug: str):
-    """جلب اسم تويتر من التخزين المؤقت"""
     if slug in _twitter_cache:
         username, timestamp = _twitter_cache[slug]
         if time.time() - timestamp < TWITTER_CACHE_DURATION:
@@ -119,11 +127,9 @@ def get_cached_twitter(slug: str):
     return None
 
 def set_cached_twitter(slug: str, username):
-    """تخزين اسم تويتر في التخزين المؤقت"""
     _twitter_cache[slug] = (username, time.time())
 
 def get_cached_drop(slug: str):
-    """جلب تفاصيل المينت من التخزين المؤقت"""
     if slug in _drop_cache:
         detail, timestamp = _drop_cache[slug]
         if time.time() - timestamp < DROP_CACHE_DURATION:
@@ -131,7 +137,6 @@ def get_cached_drop(slug: str):
     return None
 
 def set_cached_drop(slug: str, detail):
-    """تخزين تفاصيل المينت في التخزين المؤقت"""
     _drop_cache[slug] = (detail, time.time())
 
 # ==================== الوظائف الأساسية ====================
@@ -168,8 +173,6 @@ def get_eth_price_usd() -> float:
         return _eth_price_cache["value"] or 3000.0
 
 def fetch_drop_detail(slug: str):
-    """جلب تفاصيل المينت مع تخزين مؤقت"""
-    # التحقق من التخزين المؤقت أولاً
     cached = get_cached_drop(slug)
     if cached is not None:
         return True, cached
@@ -269,6 +272,14 @@ def build_gaveup_message(detail: dict, reason: str) -> str:
     name = detail.get("collection_name") or detail.get("collection_slug")
     return f"❌ <b>انتهت الفرصة</b>\n\nالمجموعة: <b>{name}</b>\nالسبب: {reason}"
 
+def build_paid_tracking_message(detail: dict) -> str:
+    name = detail.get("collection_name") or detail.get("collection_slug")
+    return f"💰 <b>مينت مدفوع قيد التتبع</b>\n\nالمجموعة: <b>{name}</b>\nالسبب: السعر الحالي مدفوع\nسيتم الشراء تلقائيًا فور تحوله إلى مجاني."
+
+def build_free_now_message(detail: dict) -> str:
+    name = detail.get("collection_name") or detail.get("collection_slug")
+    return f"🔄 <b>أصبح المينت مجانيًا!</b>\n\nالمجموعة: <b>{name}</b>\nجارٍ الشراء التلقائي..."
+
 # ---------------------------------------------------------------------------
 # الشراء المتوازي
 # ---------------------------------------------------------------------------
@@ -353,11 +364,11 @@ async def try_buy_now_multi_wallet(slug: str, chain_key: str, detail: dict):
     return list(results)
 
 # ---------------------------------------------------------------------------
-# تقييم المينتات
+# تقييم المينتات (مع تتبع المدفوعة)
 # ---------------------------------------------------------------------------
 
 async def evaluate_new_mint(slug: str, chain_key: str):
-    """تقييم المينت الجديد مع تحسينات الاكتشاف"""
+    """تقييم المينت الجديد مع تتبع المينتات المدفوعة"""
     
     # فحص سريع جداً قبل أي طلبات API
     if slug in successful_mints and len(successful_mints[slug]) >= len(WALLETS_DATA):
@@ -371,7 +382,7 @@ async def evaluate_new_mint(slug: str, chain_key: str):
 
     in_flight.add(slug)
     try:
-        # 1. جلب تفاصيل المينت (مع تخزين مؤقت)
+        # 1. جلب تفاصيل المينت
         found, detail = await asyncio.to_thread(fetch_drop_detail, slug)
         if not found or not detail or not detail.get("is_minting"):
             return
@@ -380,7 +391,7 @@ async def evaluate_new_mint(slug: str, chain_key: str):
         if not stage or not started_today_local(stage):
             return
 
-        # 2. التأكد من أن المينت مجاني
+        # 2. جلب السعر
         w3 = W3_INSTANCES[chain_key]
         eth_price_usd = get_eth_price_usd()
         contract_address = detail.get("contract_address")
@@ -389,8 +400,22 @@ async def evaluate_new_mint(slug: str, chain_key: str):
             onchain_price = await asyncio.to_thread(get_onchain_public_price_wei, w3, contract_address)
             price_wei = onchain_price if onchain_price is not None else int(stage.get("price", "0"))
             
+            # === التغيير الجديد: تتبع المينتات المدفوعة ===
             if not is_free_or_negligible(price_wei, eth_price_usd):
-                return
+                # المينت مدفوع حالياً - أضفه للتتبع
+                log.info(f"💰 '{slug}' مدفوع حالياً - جارٍ التتبع لمعرفة إن أصبح مجانياً")
+                
+                # تخزين المينت للتتبع
+                paid_mints_tracking[slug] = {
+                    "chain_key": chain_key,
+                    "detail": detail,
+                    "first_seen": time.time(),
+                    "last_check": time.time()
+                }
+                
+                # إرسال إشعار للمستخدمين
+                broadcast_message(build_paid_tracking_message(detail))
+                return  # ننتظر حتى يصبح مجانياً
 
         # 3. الفحص عبر X مع تخزين مؤقت
         twitter_username = get_cached_twitter(slug)
@@ -420,6 +445,77 @@ async def evaluate_new_mint(slug: str, chain_key: str):
         log.error(f"خطأ بتقييم '{slug}': {e}")
     finally:
         in_flight.discard(slug)
+
+# ---------------------------------------------------------------------------
+# فحص المينتات المدفوعة (الجديد)
+# ---------------------------------------------------------------------------
+
+async def scan_paid_mints():
+    """
+    فحص دوري للمينتات المدفوعة لمعرفة إن أصبحت مجانية
+    يتم تشغيله كل 20 ثانية
+    """
+    while True:
+        try:
+            await asyncio.sleep(20)  # كل 20 ثانية
+            
+            # نسخة من المينتات المدفوعة لتجنب التعديل أثناء التكرار
+            current_paid = list(paid_mints_tracking.items())
+            
+            for slug, data in current_paid:
+                # التحقق من أنه لا يزال في المراقبة
+                if slug in successful_mints and len(successful_mints[slug]) >= len(WALLETS_DATA):
+                    paid_mints_tracking.pop(slug, None)
+                    continue
+                
+                # جلب التفاصيل الجديدة
+                found, fresh_detail = await asyncio.to_thread(fetch_drop_detail, slug)
+                if not found or not fresh_detail or not fresh_detail.get("is_minting"):
+                    log.info(f"⏹️ '{slug}' لم يعد نشطاً - إزالة من التتبع")
+                    paid_mints_tracking.pop(slug, None)
+                    continue
+                
+                stage = fresh_detail.get("active_stage")
+                if not stage:
+                    continue
+                
+                # جلب السعر الجديد
+                chain_key = data.get("chain_key", "ethereum")
+                w3 = W3_INSTANCES[chain_key]
+                eth_price_usd = get_eth_price_usd()
+                contract_address = fresh_detail.get("contract_address")
+                
+                if contract_address:
+                    onchain_price = await asyncio.to_thread(get_onchain_public_price_wei, w3, contract_address)
+                    price_wei = onchain_price if onchain_price is not None else int(stage.get("price", "0"))
+                    
+                    # هل أصبح مجانياً؟
+                    if is_free_or_negligible(price_wei, eth_price_usd):
+                        log.info(f"🔄 [تغير السعر] '{slug}' أصبح مجانياً! جارٍ الشراء...")
+                        
+                        # إرسال إشعار للمستخدمين
+                        broadcast_message(build_free_now_message(fresh_detail))
+                        
+                        # إزالة من التتبع
+                        paid_mints_tracking.pop(slug, None)
+                        
+                        # معالجة المينت كأنه جديد
+                        asyncio.create_task(evaluate_new_mint(slug, chain_key))
+                    else:
+                        # لا يزال مدفوعاً، تحديث التفاصيل
+                        paid_mints_tracking[slug] = {
+                            "chain_key": chain_key,
+                            "detail": fresh_detail,
+                            "first_seen": data.get("first_seen", time.time()),
+                            "last_check": time.time()
+                        }
+                        
+        except Exception as e:
+            log.error(f"خطأ في فحص المينتات المدفوعة: {e}")
+
+# ---------------------------------------------------------------------------
+# watch_loop (نفس الكود الأصلي)
+# ---------------------------------------------------------------------------
 
 async def watch_loop():
     while True:
@@ -469,24 +565,21 @@ async def watch_loop():
                 in_flight.discard(slug)
 
 # ---------------------------------------------------------------------------
-# الاستماع إلى OpenSea المحسن
+# الاستماع إلى OpenSea
 # ---------------------------------------------------------------------------
 
 async def process_event_buffer():
-    """معالجة الأحداث المجمعة"""
     global event_buffer, last_flush
     
     if not event_buffer:
         return
     
-    # تجميع الأحداث حسب الـ slug (تجنب التكرار)
     unique_events = {}
     for event in event_buffer:
         slug = event['slug']
         if slug not in unique_events or event['timestamp'] > unique_events[slug]['timestamp']:
             unique_events[slug] = event
     
-    # معالجة كل حدث فريد
     for event in unique_events.values():
         asyncio.create_task(evaluate_new_mint(event['slug'], event['chain_key']))
     
@@ -549,14 +642,12 @@ async def listen_opensea():
                     if not slug:
                         continue
 
-                    # تخزين الحدث للمعالجة المجمعة
                     event_buffer.append({
                         'slug': slug,
                         'chain_key': chain_key,
                         'timestamp': time.time()
                     })
 
-                    # معالجة فورية إذا وصلنا للحد الأقصى
                     if len(event_buffer) >= MAX_BUFFER_SIZE:
                         await process_event_buffer()
 
@@ -567,9 +658,7 @@ async def listen_opensea():
             log.error(f"خطأ غير متوقع: {e}.")
             await asyncio.sleep(5)
 
-# ---------------------------------------------------------------------------
-# التشغيل الرئيسي
-# ---------------------------------------------------------------------------
+# ==================== التشغيل الرئيسي ====================
 
 async def run():
     if not BOT_ENABLED:
@@ -579,7 +668,14 @@ async def run():
         return
 
     broadcast_message(f"✅ تم تشغيل المحفظة الخاصة بك بنجاح وربطها بهذا البوت!")
-    await asyncio.gather(listen_opensea(), watch_loop(), telegram_sender())
+    
+    # تشغيل جميع المهام بالتوازي
+    await asyncio.gather(
+        listen_opensea(),        # الطبقة 1: WebSocket
+        scan_paid_mints(),       # الطبقة 2: فحص المينتات المدفوعة
+        watch_loop(),            # مراقبة المينتات المدفوعة
+        telegram_sender()        # إرسال الرسائل
+    )
 
 def main():
     backoff = 2
