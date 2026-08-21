@@ -8,6 +8,7 @@ import logging
 import time
 from web3 import Web3
 from web3.exceptions import TransactionNotFound, ContractLogicError
+from web3.middleware import ExtraDataToPOAMiddleware
 
 log = logging.getLogger("buyer")
 
@@ -74,7 +75,15 @@ def get_wallet_lock(wallet_address: str) -> asyncio.Lock:
     return wallet_locks[addr]
 
 def get_web3(rpc_url: str) -> Web3:
-    return Web3(Web3.HTTPProvider(rpc_url))
+    """إنشاء كائن Web3 مع دعم POA"""
+    w3 = Web3(Web3.HTTPProvider(rpc_url))
+    # إضافة middleware لـ POA (مطلوب لـ Robinhood Chain)
+    try:
+        w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+    except Exception:
+        # قد يكون بالفعل مضافاً
+        pass
+    return w3
 
 def get_wallet_balance_usd(w3: Web3, wallet_address: str, eth_price_usd: float) -> float:
     try:
