@@ -1,6 +1,6 @@
 """
 محرك الشراء التلقائي المتعدد المحافظ عبر عقد SeaDrop.
-مع استخدام قيمة ثابتة للغاز لتسريع المعالجة.
+مع تقدير الغاز من العقد.
 """
 
 import asyncio
@@ -63,9 +63,6 @@ GAS_LIMIT_SAFETY_MARGIN = 1.2
 MAX_RETRY_ATTEMPTS = 3
 RETRY_DELAY_SECONDS = 2
 
-# قيمة ثابتة للغاز (توفير وقت التقدير)
-FIXED_GAS_LIMIT = 300000
-
 wallet_locks = {}
 
 def get_wallet_lock(wallet_address: str) -> asyncio.Lock:
@@ -91,7 +88,7 @@ def get_wallet_balance_usd(w3: Web3, wallet_address: str, eth_price_usd: float) 
         log.error(f"[الرصيد] تعذر القراءة للمحفظة {wallet_address[:8]}...: {e}")
         return 0.0
 
-def estimate_gas_fee_usd(w3: Web3, eth_price_usd: float, gas_units: int = FIXED_GAS_LIMIT) -> float:
+def estimate_gas_fee_usd(w3: Web3, eth_price_usd: float, gas_units: int = 150_000) -> float:
     try:
         gas_price_wei = w3.eth.gas_price
         fee_eth = (gas_price_wei * gas_units) / 1e18
@@ -170,26 +167,31 @@ def attempt_purchase_single_wallet(
         log.error(f"[عنوان غير صالح] للمحفظة {wallet_address[:8]}...: {e}")
         return {"success": False, "wallet": wallet_address, "reason": "invalid_address", "error": str(e)}
 
+    # فحص الرصيد
     balance_usd = get_wallet_balance_usd(w3, checksum_wallet, eth_price_usd)
     if balance_usd < MIN_BALANCE_RESERVE_USD:
         log.warning(f"⚠️ رصيد منخفض للمحفظة {checksum_wallet[:8]}...: ${balance_usd:.4f}")
         return {"success": False, "wallet": checksum_wallet, "reason": "balance_too_low", "balance_usd": balance_usd}
 
-    gas_fee_usd = estimate_gas_fee_usd(w3, eth_price_usd, FIXED_GAS_LIMIT)
+    # تقدير الغاز المبدئي
+    gas_fee_usd = estimate_gas_fee_usd(w3, eth_price_usd)
     if gas_fee_usd > max_gas_fee_usd:
         log.warning(f"⚠️ رسوم غاز مرتفعة للمحفظة {checksum_wallet[:8]}...: ${gas_fee_usd:.4f}")
         return {"success": False, "wallet": checksum_wallet, "reason": "gas_too_high", "gas_fee_usd": gas_fee_usd}
 
+    # الحصول على عنوان الرسوم
     fee_recipient = get_fee_recipient(w3, checksum_contract)
     if not fee_recipient:
         log.warning(f"⚠️ لا يوجد مستفيد للعقد {checksum_contract[:8]}... - استخدام عنوان الصفر")
         fee_recipient = ZERO_ADDRESS
 
+    # تحديد الكمية
     quantity = decide_quantity(max_per_wallet, remaining_supply)
     total_value = price_wei_per_token * quantity
     
     log.info(f"💰 محاولة شراء {quantity} من {checksum_contract[:8]}... للمحفظة {checksum_wallet[:8]}...")
 
+    # بناء المعاملة
     try:
         contract = w3.eth.contract(address=SEADROP_ADDRESS, abi=SEADROP_ABI)
         nonce = w3.eth.get_transaction_count(checksum_wallet, "pending")
@@ -204,21 +206,31 @@ def attempt_purchase_single_wallet(
             "value": total_value,
             "nonce": nonce,
             "chainId": w3.eth.chain_id,
-            "gas": FIXED_GAS_LIMIT,  # ✅ استخدام قيمة ثابتة للغاز (بدون تقدير)
         })
-        
-        log.info(f"📊 استخدام غاز ثابت: {FIXED_GAS_LIMIT}")
-        
     except Exception as e:
         log.error(f"❌ فشل بناء المعاملة للمحفظة {checksum_wallet[:8]}...: {e}")
         return {"success": False, "wallet": checksum_wallet, "reason": "build_tx_failed", "error": str(e)}
 
+    # ✅ تقدير الغاز من العقد (الأصلي)
+    try:
+        estimated_gas = w3.eth.estimate_gas(tx)
+        tx["gas"] = int(estimated_gas * GAS_LIMIT_SAFETY_MARGIN)
+        log.info(f"📊 الغاز المقدر: {estimated_gas} → مع هامش: {tx['gas']}")
+    except ContractLogicError as e:
+        error_analysis = analyze_error(e)
+        log.error(f"❌ فشل تقدير الغاز (منطق العقد) للمحفظة {checksum_wallet[:8]}...: {error_analysis['reason']}")
+        return {"success": False, "wallet": checksum_wallet, "reason": f"contract_reverted_{error_analysis['reason']}", "error": str(e)}
+    except Exception as e:
+        log.error(f"❌ فشل تقدير الغاز للمحفظة {checksum_wallet[:8]}...: {e}")
+        return {"success": False, "wallet": checksum_wallet, "reason": "gas_estimation_failed", "error": str(e)}
+
+    # التحقق من التكلفة النهائية
     try:
         gas_price = w3.eth.gas_price
         actual_gas_fee_usd = (tx["gas"] * gas_price / 1e18) * eth_price_usd
         
         if actual_gas_fee_usd > max_gas_fee_usd:
-            log.warning(f"⚠️ رسوم غاز مرتفعة للمحفظة {checksum_wallet[:8]}...: ${actual_gas_fee_usd:.4f}")
+            log.warning(f"⚠️ رسوم غاز فعلية مرتفعة للمحفظة {checksum_wallet[:8]}...: ${actual_gas_fee_usd:.4f}")
             return {"success": False, "wallet": checksum_wallet, "reason": "gas_too_high_actual", "gas_fee_usd": actual_gas_fee_usd}
         
         total_cost_wei = total_value + (tx["gas"] * gas_price)
@@ -231,6 +243,7 @@ def attempt_purchase_single_wallet(
         log.error(f"❌ فشل التحقق من التكلفة للمحفظة {checksum_wallet[:8]}...: {e}")
         return {"success": False, "wallet": checksum_wallet, "reason": "pre_send_check_failed", "error": str(e)}
 
+    # توقيع وإرسال المعاملة مع إعادة محاولة
     for attempt in range(MAX_RETRY_ATTEMPTS):
         try:
             log.info(f"📤 محاولة {attempt + 1}/{MAX_RETRY_ATTEMPTS} لإرسال المعاملة للمحفظة {checksum_wallet[:8]}...")
