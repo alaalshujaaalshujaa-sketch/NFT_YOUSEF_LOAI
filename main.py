@@ -4,13 +4,13 @@
   - يشتري لجميع المحافظ المعرفة بالتوازي (Parallel Execution)
   - يرسل إشعار الشراء فقط
   
-تحسينات السرعة القصوى:
-- تخزين مؤقت قصير جداً (1 ثانية)
-- معالجة متوازية عالية (10 مهام)
-- إعادة اتصال سريع (0.5 ثانية)
-- تخطي التحقق من تويتر للمينتات المعروفة
-- استخدام قيمة ثابتة للغاز
-- مهلة قصيرة للطلبات (3 ثواني)
+تحسينات السرعة المتوازنة:
+- تخزين مؤقت قصير (3 ثواني)
+- معالجة متوازية (5 مهام)
+- إعادة اتصال سريع (1 ثانية)
+- تحليل المراحل المدفوعة والمجانية
+- التحقق الكامل من تويتر
+- تقدير الغاز من العقد
 """
 
 import asyncio
@@ -71,42 +71,13 @@ RECV_TIMEOUT = 5
 FREE_PRICE_THRESHOLD_USD = 0.01
 WATCH_POLL_INTERVAL_SECONDS = 15
 
-# ==================== إعدادات السرعة القصوى ====================
+# ==================== إعدادات السرعة المتوازنة ====================
 
-# تخزين مؤقت قصير جداً
-DROP_CACHE_DURATION = 1  # ثانية واحدة فقط
-TWITTER_CACHE_DURATION = 60  # دقيقة واحدة
-
-# معالجة متوازية عالية
-MAX_PARALLEL_TASKS = 10
-
-# مهلة قصيرة للطلبات
-API_TIMEOUT = 3  # 3 ثواني فقط
-
-# إعادة اتصال سريع
-RECONNECT_DELAY = 0.5  # نصف ثانية
-
-# قيمة ثابتة للغاز (توفير وقت التقدير)
-FIXED_GAS_LIMIT = 300000
-
-# قائمة المينتات السريعة المعروفة (تخطي التحقق من تويتر)
-FAST_MINTS = [
-    "azuki",
-    "bored-ape-yacht-club",
-    "pudgy-penguins",
-    "doodles",
-    "clone-x",
-    "otherdeed",
-    "goblintown",
-    "moonbirds",
-    "coolcats",
-    "mfers",
-    "rektguy",
-    "the-robot-apes",
-    "parallel-alpha",
-    "digidaigaku",
-    "0n1-force",
-]
+DROP_CACHE_DURATION = 3  # 3 ثواني
+TWITTER_CACHE_DURATION = 300  # 5 دقائق
+MAX_PARALLEL_TASKS = 5
+API_TIMEOUT = 5
+RECONNECT_DELAY = 1
 
 logging.basicConfig(
     level=logging.INFO,
@@ -179,10 +150,6 @@ def should_prioritize(slug: str) -> bool:
     wait_time = time.time() - first_seen
     is_fast = slug in get_fast_converting_mints(limit=10)
     return check_count > 8 or wait_time > 300 or is_fast
-
-def is_fast_mint(slug: str) -> bool:
-    """تحديد إذا كان المينت من المينتات السريعة المعروفة"""
-    return slug in FAST_MINTS
 
 # ==================== إحصائيات البوت ====================
 
@@ -296,6 +263,12 @@ def parse_iso(ts: str):
     except Exception:
         return None
 
+def started_today_local(stage: dict) -> bool:
+    start = parse_iso(stage.get("start_time", ""))
+    if not start:
+        return False
+    return start.astimezone(LOCAL_TZ).date() == datetime.now(LOCAL_TZ).date()
+
 def stage_has_ended(stage: dict) -> bool:
     end = parse_iso(stage.get("end_time", ""))
     if not end:
@@ -305,6 +278,21 @@ def stage_has_ended(stage: dict) -> bool:
 def is_free_or_negligible(price_wei: int, eth_price_usd: float) -> bool:
     price_usd = (price_wei / 1e18) * eth_price_usd
     return price_usd < FREE_PRICE_THRESHOLD_USD
+
+def will_start_soon(stage: dict, minutes: int = 60) -> bool:
+    start = parse_iso(stage.get("start_time", ""))
+    if not start:
+        return False
+    now = datetime.now(timezone.utc)
+    time_diff = (start - now).total_seconds() / 60
+    return 0 <= time_diff <= minutes
+
+def is_active_or_upcoming(stage: dict) -> bool:
+    if started_today_local(stage):
+        return True
+    if will_start_soon(stage, 60):
+        return True
+    return False
 
 # ==================== اكتشاف المراحل ====================
 
@@ -567,7 +555,7 @@ def build_startup_message() -> str:
         f"🚀 <b>تم تشغيل البوت بنجاح!</b>\n\n"
         f"📊 عدد المحافظ: {wallet_count}\n"
         f"🔗 الشبكات: Robinhood + Ethereum\n"
-        f"⚡ الوضع: فائق السرعة (اكتشاف < 1 ثانية)\n"
+        f"⚡ الوضع: سريع متوازن (اكتشاف 1-3 ثواني)\n"
         f"🔄 جارٍ مراقبة المينتات المجانية..."
     )
 
@@ -707,12 +695,12 @@ async def try_buy_now_multi_wallet(slug: str, chain_key: str, detail: dict):
     return list(results)
 
 # ---------------------------------------------------------------------------
-# تقييم المينتات فائق السرعة
+# تقييم المينتات (مع تحليل المراحل والتحقق الكامل من تويتر)
 # ---------------------------------------------------------------------------
 
-async def evaluate_new_mint_ultra_fast(slug: str, chain_key: str):
+async def evaluate_new_mint(slug: str, chain_key: str):
     """
-    نسخة فائقة السرعة - معالجة فورية مع تخطي التحقق من تويتر للمينتات المعروفة
+    تقييم المينت مع تحليل المراحل والتحقق الكامل من تويتر
     """
     if slug in successful_mints and len(successful_mints[slug]) >= len(WALLETS_DATA):
         return
@@ -723,32 +711,6 @@ async def evaluate_new_mint_ultra_fast(slug: str, chain_key: str):
     if is_in_cooldown(slug):
         return
 
-    # ===== للمينتات السريعة المعروفة: معالجة فورية =====
-    if is_fast_mint(slug):
-        log.info(f"⚡ مينت سريع معروف: {slug} - معالجة فورية (بدون تحقق تويتر)!")
-        in_flight.add(slug)
-        try:
-            found, detail = await asyncio.to_thread(fetch_drop_detail, slug)
-            if found and detail:
-                stage = detail.get("active_stage")
-                if stage:
-                    # تحليل المراحل
-                    analysis = analyze_mint_stages(slug, detail)
-                    if slug not in discovered_mints:
-                        await log_mint_stages(slug, chain_key)
-                        discovered_mints.add(slug)
-                    
-                    # شراء فوري (بدون تحقق تويتر)
-                    results = await try_buy_now_multi_wallet(slug, chain_key, detail)
-                    if results is None:
-                        watchlist[slug] = {"chain_key": chain_key, "detail": detail}
-                    elif len(successful_mints.get(slug, set())) < len(WALLETS_DATA):
-                        watchlist[slug] = {"chain_key": chain_key, "detail": detail}
-        finally:
-            in_flight.discard(slug)
-        return
-
-    # ===== للمينتات العادية: معالجة عادية =====
     in_flight.add(slug)
     try:
         found, detail = await asyncio.to_thread(fetch_drop_detail, slug)
@@ -794,15 +756,18 @@ async def evaluate_new_mint_ultra_fast(slug: str, chain_key: str):
                     mark_rejected(slug)
                 return
 
-        # التحقق من تويتر للمينتات العادية
+        # ✅ التحقق الكامل من تويتر (الأصلي)
         twitter_username = get_cached_twitter(slug)
         if twitter_username is None:
             twitter_username = await asyncio.to_thread(get_twitter_username_from_opensea, slug, OPENSEA_API_KEY)
             set_cached_twitter(slug, twitter_username)
         
         if not twitter_username:
+            log.info(f"⏭️ تجاهل '{slug}': لا يوجد حساب X مربوط.")
             mark_rejected(slug)
             return
+
+        log.info(f"✅ '{slug}': يوجد حساب X مربوط (@{twitter_username}) — المتابعة للشراء.")
 
         results = await try_buy_now_multi_wallet(slug, chain_key, detail)
 
@@ -895,7 +860,7 @@ async def scan_paid_mints():
                         
                         log.info(f"🔄 '{slug}' أصبح مجانياً بعد {wait_time:.0f} ثانية!")
                         paid_mints_tracking.pop(slug, None)
-                        asyncio.create_task(evaluate_new_mint_ultra_fast(slug, chain_key))
+                        asyncio.create_task(evaluate_new_mint(slug, chain_key))
                     else:
                         paid_mints_tracking[slug] = {
                             "chain_key": chain_key,
@@ -984,15 +949,40 @@ async def watch_loop():
                 in_flight.discard(slug)
 
 # ---------------------------------------------------------------------------
-# الاستماع فائق السرعة إلى OpenSea
+# الاستماع إلى OpenSea (مع تجميع محسن)
 # ---------------------------------------------------------------------------
 
-async def listen_opensea_ultra_fast():
+event_buffer = []
+last_flush = time.time()
+BUFFER_FLUSH_INTERVAL = 2
+MAX_BUFFER_SIZE = 8
+
+async def process_event_buffer():
+    global event_buffer, last_flush
+    
+    if not event_buffer:
+        return
+    
+    unique_events = {}
+    for event in event_buffer:
+        slug = event['slug']
+        if slug not in unique_events or event['timestamp'] > unique_events[slug]['timestamp']:
+            unique_events[slug] = event
+    
+    for event in unique_events.values():
+        asyncio.create_task(evaluate_new_mint(event['slug'], event['chain_key']))
+    
+    event_buffer = []
+    last_flush = time.time()
+
+async def listen_opensea():
+    global event_buffer, last_flush
+    
     msg_ref = 0
     while True:
         try:
-            async with websockets.connect(STREAM_URL, ping_interval=None, open_timeout=5) as ws:
-                log.info(f"⚡ متصل بـ OpenSea Stream (وضع فائق السرعة) — يراقب لـ {len(WALLETS_DATA)} محافظ.")
+            async with websockets.connect(STREAM_URL, ping_interval=None, open_timeout=10) as ws:
+                log.info(f"🚀 متصل بـ OpenSea Stream — يراقب لـ {len(WALLETS_DATA)} محافظ.")
                 join_ref = str(msg_ref)
                 await ws.send(json.dumps([join_ref, join_ref, "collection:*", "phx_join", {}]))
                 msg_ref += 1
@@ -1008,6 +998,8 @@ async def listen_opensea_ultra_fast():
                     try:
                         raw = await asyncio.wait_for(ws.recv(), timeout=RECV_TIMEOUT)
                     except asyncio.TimeoutError:
+                        if event_buffer and time.time() - last_flush > BUFFER_FLUSH_INTERVAL:
+                            await process_event_buffer()
                         continue
 
                     try:
@@ -1020,7 +1012,7 @@ async def listen_opensea_ultra_fast():
                     else:
                         continue
 
-                    # قبول جميع الأحداث ذات الصلة
+                    # قبول الأحداث ذات الصلة
                     if event_name not in ["item_transferred", "item_listed", "collection_created", "drop_created"]:
                         continue
 
@@ -1043,11 +1035,17 @@ async def listen_opensea_ultra_fast():
                     if not slug:
                         continue
 
-                    # معالجة فورية فائقة السرعة
-                    asyncio.create_task(evaluate_new_mint_ultra_fast(slug, chain_key))
+                    event_buffer.append({
+                        'slug': slug,
+                        'chain_key': chain_key,
+                        'timestamp': time.time()
+                    })
+
+                    if len(event_buffer) >= MAX_BUFFER_SIZE:
+                        await process_event_buffer()
 
         except (websockets.ConnectionClosed, OSError, asyncio.TimeoutError) as e:
-            log.warning(f"انقطع الاتصال. إعادة الاتصال فوراً...")
+            log.warning(f"انقطع الاتصال ({e}). إعادة الاتصال...")
             await asyncio.sleep(RECONNECT_DELAY)
         except Exception as e:
             log.error(f"خطأ غير متوقع: {e}.")
@@ -1064,13 +1062,13 @@ async def run():
         return
 
     broadcast_message(build_startup_message())
-    log.info("🚀 تم تشغيل البوت بنجاح (وضع فائق السرعة)!")
+    log.info("🚀 تم تشغيل البوت بنجاح!")
     
     await asyncio.sleep(2)
     await test_telegram()
     
     await asyncio.gather(
-        listen_opensea_ultra_fast(),
+        listen_opensea(),
         scan_paid_mints(),
         watch_loop(),
         status_reporter(),
