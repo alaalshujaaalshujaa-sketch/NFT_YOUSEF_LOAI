@@ -59,8 +59,7 @@ FEW_THRESHOLD = 20
 LIMITED_BUY_QTY = 15
 GAS_LIMIT_SAFETY_MARGIN = 1.2
 
-# ✅ التحسين 4: تقليل عدد المحاولات الفاشلة من 3 إلى 1
-MAX_RETRY_ATTEMPTS = 1
+MAX_RETRY_ATTEMPTS = 3
 RETRY_DELAY_SECONDS = 2
 
 wallet_locks = {}
