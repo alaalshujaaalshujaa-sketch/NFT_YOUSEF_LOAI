@@ -1,5 +1,6 @@
 """
 محرك الشراء التلقائي المتعدد المحافظ عبر عقد SeaDrop.
+مع استخدام قيمة ثابتة للغاز لتسريع المعالجة.
 """
 
 import asyncio
@@ -62,6 +63,9 @@ GAS_LIMIT_SAFETY_MARGIN = 1.2
 MAX_RETRY_ATTEMPTS = 3
 RETRY_DELAY_SECONDS = 2
 
+# قيمة ثابتة للغاز (توفير وقت التقدير)
+FIXED_GAS_LIMIT = 300000
+
 wallet_locks = {}
 
 def get_wallet_lock(wallet_address: str) -> asyncio.Lock:
@@ -87,7 +91,7 @@ def get_wallet_balance_usd(w3: Web3, wallet_address: str, eth_price_usd: float) 
         log.error(f"[الرصيد] تعذر القراءة للمحفظة {wallet_address[:8]}...: {e}")
         return 0.0
 
-def estimate_gas_fee_usd(w3: Web3, eth_price_usd: float, gas_units: int = 150_000) -> float:
+def estimate_gas_fee_usd(w3: Web3, eth_price_usd: float, gas_units: int = FIXED_GAS_LIMIT) -> float:
     try:
         gas_price_wei = w3.eth.gas_price
         fee_eth = (gas_price_wei * gas_units) / 1e18
@@ -171,7 +175,7 @@ def attempt_purchase_single_wallet(
         log.warning(f"⚠️ رصيد منخفض للمحفظة {checksum_wallet[:8]}...: ${balance_usd:.4f}")
         return {"success": False, "wallet": checksum_wallet, "reason": "balance_too_low", "balance_usd": balance_usd}
 
-    gas_fee_usd = estimate_gas_fee_usd(w3, eth_price_usd)
+    gas_fee_usd = estimate_gas_fee_usd(w3, eth_price_usd, FIXED_GAS_LIMIT)
     if gas_fee_usd > max_gas_fee_usd:
         log.warning(f"⚠️ رسوم غاز مرتفعة للمحفظة {checksum_wallet[:8]}...: ${gas_fee_usd:.4f}")
         return {"success": False, "wallet": checksum_wallet, "reason": "gas_too_high", "gas_fee_usd": gas_fee_usd}
@@ -200,29 +204,21 @@ def attempt_purchase_single_wallet(
             "value": total_value,
             "nonce": nonce,
             "chainId": w3.eth.chain_id,
+            "gas": FIXED_GAS_LIMIT,  # ✅ استخدام قيمة ثابتة للغاز (بدون تقدير)
         })
+        
+        log.info(f"📊 استخدام غاز ثابت: {FIXED_GAS_LIMIT}")
+        
     except Exception as e:
         log.error(f"❌ فشل بناء المعاملة للمحفظة {checksum_wallet[:8]}...: {e}")
         return {"success": False, "wallet": checksum_wallet, "reason": "build_tx_failed", "error": str(e)}
-
-    try:
-        estimated_gas = w3.eth.estimate_gas(tx)
-        tx["gas"] = int(estimated_gas * GAS_LIMIT_SAFETY_MARGIN)
-        log.info(f"📊 الغاز المقدر: {estimated_gas} → مع هامش: {tx['gas']}")
-    except ContractLogicError as e:
-        error_analysis = analyze_error(e)
-        log.error(f"❌ فشل تقدير الغاز (منطق العقد) للمحفظة {checksum_wallet[:8]}...: {error_analysis['reason']}")
-        return {"success": False, "wallet": checksum_wallet, "reason": f"contract_reverted_{error_analysis['reason']}", "error": str(e)}
-    except Exception as e:
-        log.error(f"❌ فشل تقدير الغاز للمحفظة {checksum_wallet[:8]}...: {e}")
-        return {"success": False, "wallet": checksum_wallet, "reason": "gas_estimation_failed", "error": str(e)}
 
     try:
         gas_price = w3.eth.gas_price
         actual_gas_fee_usd = (tx["gas"] * gas_price / 1e18) * eth_price_usd
         
         if actual_gas_fee_usd > max_gas_fee_usd:
-            log.warning(f"⚠️ رسوم غاز فعلية مرتفعة للمحفظة {checksum_wallet[:8]}...: ${actual_gas_fee_usd:.4f}")
+            log.warning(f"⚠️ رسوم غاز مرتفعة للمحفظة {checksum_wallet[:8]}...: ${actual_gas_fee_usd:.4f}")
             return {"success": False, "wallet": checksum_wallet, "reason": "gas_too_high_actual", "gas_fee_usd": actual_gas_fee_usd}
         
         total_cost_wei = total_value + (tx["gas"] * gas_price)
